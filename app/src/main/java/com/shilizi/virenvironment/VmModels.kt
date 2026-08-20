@@ -160,7 +160,8 @@ class VmViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun saveRecentImages() {
         prefs.edit().apply {
-            clear()
+            // 只清理 recent_ 前缀键，避免 clear() 误删 virtual_disk_* 等其他持久化键
+            prefs.all.keys.filter { it.startsWith("recent_") }.forEach { remove(it) }
             putInt("recent_count", _recentImages.value.size)
             _recentImages.value.forEachIndexed { i, r ->
                 putString("recent_${i}_uri", r.uri)
