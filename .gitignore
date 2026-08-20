@@ -1,0 +1,18 @@
+*.iml
+.gradle
+/local.properties
+/.idea
+.DS_Store
+/build
+/captures
+.externalNativeBuild
+.cxx
+.kotlin
+local.properties
+app/src/main/jniLibs/*/*.so
+
+# Release signing (私钥不入库)
+/keystore
+*.jks
+*.storepass
+*.keystore

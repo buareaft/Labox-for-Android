@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>LABOX · v86</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #000; overflow: hidden; }
+  #screen { position: fixed; top: 0; left: 0; right: 0; bottom: 0; }
+  #screen canvas { image-rendering: pixelated; }
+  #kb {
+    position: fixed; left: 0; right: 0; bottom: 0; height: 120px; display: none;
+    background: #1c1f22; color: #e8e8e8; font-size: 16px; padding: 8px;
+    box-sizing: border-box; resize: none; border: none; outline: none; z-index: 10;
+  }
+  #err {
+    position: fixed; left: 8px; right: 8px; top: 8px; display: none;
+    background: rgba(150, 25, 25, .92); color: #fff; font-family: monospace;
+    font-size: 12px; padding: 10px; white-space: pre-wrap; z-index: 20;
+  }
+</style>
+</head>
+<body>
+<div id="screen"></div>
+<textarea id="kb" placeholder="软键盘输入…"></textarea>
+<div id="err"></div>
+<script src="libv86.js"></script>
+<script>
+"use strict";
+window.onerror = function (message, source, line, col, error) {
+  document.title = "labox-js-error: " + message + " @" + line;
+  return false;
+};
+(function () {
+  document.title = "labox-script-start";
+  var params = new URLSearchParams(location.search);
+  var memoryMb = Math.min(parseInt(params.get("memory") || "256", 10) || 256, 512);
+  var imagePath = params.get("image") || "/images/disk";
+  var imageType = params.get("type") || "iso";
+  var emulator = null;
+
+  function fail(message) {
+    var box = document.getElementById("err");
+    box.textContent = message;
+    box.style.display = "block";
+    // 启动失败也上报状态，Android 端据此弹出失败提示
+    window.laboxVmStatus = "error";
+    window.laboxVmDetail = message;
+  }
+
+  var options = {
+    wasm_path: "v86.wasm",
+    memory_size: memoryMb * 1024 * 1024,
+    vga_memory_size: 8 * 1024 * 1024,
+    screen_container: document.getElementById("screen"),
+    bios: { url: "seabios.bin" },
+    vga_bios: { url: "vgabios.bin" },
+    autostart: true,
+    disable_jit: false
+  };
+  if (imageType === "iso") {
+    options.cdrom = { url: imagePath };
+  } else if (imageType === "floppy") {
+    // 软盘镜像（FreeDOS 引导盘等）：必须挂 fda（软驱 A）才能引导。
+    // 若当 hda 硬盘挂载，BIOS 找不到引导扇区，输出几行文本后停在黑屏。
+    options.fda = { url: imagePath };
+  } else {
+    options.hda = { url: imagePath };
+  }
+
+  window.laboxEmulator = null;
+  window.laboxError = "";
+  document.title = "labox-v86-loading";
+
+  function boot() {
+    try {
+      emulator = new V86(options);
+      window.laboxEmulator = emulator;
+      document.title = "labox-v86-ok";
+    } catch (error) {
+      document.title = "labox-v86-fail: " + error;
+      fail("v86 初始化失败: " + error);
+    }
+  }
+
+  if (typeof WebAssembly === "undefined") {
+    document.title = "labox-v86-no-wasm";
+    fail("当前 WebView 不支持 WebAssembly，无法运行 v86");
+  } else {
+    boot();
+  }
+
+  // 软键盘：新增字符转发给虚拟机，退格发送退格扫描码
+  var kb = document.getElementById("kb");
+  var previous = "";
+  kb.addEventListener("focus", function () { previous = kb.value; });
+  kb.addEventListener("input", function () {
+    if (!emulator) return;
+    var value = kb.value;
+    var index = 0;
+    while (index < previous.length && index < value.length && previous.charAt(index) === value.charAt(index)) {
+      index++;
+    }
+    var deleted = previous.length - index;
+    var inserted = value.substring(index);
+    for (var i = 0; i < deleted; i++) {
+      emulator.keyboard_send_scancodes([0x0E, 0x8E]);
+    }
+    if (inserted.length) {
+      emulator.keyboard_send_text(inserted);
+    }
+    previous = value;
+  });
+
+  // 供 Android 端调用的控制接口
+  window.laboxPause = function () { if (emulator) { try { emulator.pause(); } catch (e) {} } };
+  window.laboxResume = function () { if (emulator) { try { emulator.continue(); } catch (e) {} } };
+  window.laboxStop = function () {
+    if (emulator) {
+      try { emulator.stop(); } catch (e) {}
+      emulator = null;
+      window.laboxEmulator = null;
+    }
+    // 直接上报停止状态：v86 的 stop() 不保证触发 emulator-stopped 事件
+    window.laboxVmStatus = "stopped";
+    window.laboxVmDetail = "user-stop";
+  };
+
+  // 完成状态上报：Android 端轮询 window.laboxVmStatus 检测 v86 是否停止/出错。
+  // v86 的 bus 会在 stop/异常时发 "emulator-stopped"（libv86 内部事件）。
+  window.laboxVmStatus = "loading";
+  window.laboxVmDetail = "";
+  var v86Emu = window.laboxEmulator;
+  if (v86Emu && v86Emu.bus) {
+    v86Emu.bus.register("emulator-stopped", function () {
+      window.laboxVmStatus = "stopped";
+      window.laboxVmDetail = "emulator-stopped";
+    });
+  }
+  // 也监听 screen-put-char（v86 渲染文本输出 = 正在运行），标记 running
+  var v86Screen = document.getElementById("screen");
+  if (v86Emu && v86Emu.bus) {
+    v86Emu.bus.register("screen-put-char", function () {
+      if (window.laboxVmStatus !== "stopped") {
+        window.laboxVmStatus = "running";
+      }
+    });
+  }
+  // 诊断：autostop_ms 参数用于自动化测试（到期自动停止虚拟机，验证停止状态上报链路）
+  var autostopMs = parseInt(params.get("autostop_ms") || "0", 10) || 0;
+  if (autostopMs > 0) {
+    setTimeout(function () { window.laboxStop(); }, autostopMs);
+  }
+
+  window.laboxKeyboard = function (visible) {
+    kb.style.display = visible ? "block" : "none";
+    if (visible) { kb.focus(); } else { kb.blur(); }
+  };
+
+  // 触摸 → 鼠标：单指点击 = 左键，拖动 = 移动指针
+  var screenEl = document.getElementById("screen");
+  var touching = false;
+  var lastX = 0;
+  var lastY = 0;
+
+  screenEl.addEventListener("touchstart", function (event) {
+    if (!emulator) return;
+    if (event.touches.length === 1) {
+      touching = true;
+      lastX = event.touches[0].clientX;
+      lastY = event.touches[0].clientY;
+    }
+  }, { passive: true });
+
+  screenEl.addEventListener("touchmove", function (event) {
+    if (!emulator || !touching) return;
+    var touch = event.touches[0];
+    var dx = touch.clientX - lastX;
+    var dy = touch.clientY - lastY;
+    if (dx !== 0 || dy !== 0) {
+      emulator.mouse_send_delta(dx, dy);
+      lastX = touch.clientX;
+      lastY = touch.clientY;
+    }
+    event.preventDefault();
+  }, { passive: false });
+
+  screenEl.addEventListener("touchend", function (event) {
+    if (!emulator || !touching) return;
+    touching = false;
+    var touch = event.changedTouches[0];
+    var dx = touch.clientX - lastX;
+    var dy = touch.clientY - lastY;
+    // 几乎没有位移 = 点击
+    if (Math.abs(dx) < 6 && Math.abs(dy) < 6) {
+      emulator.mouse_send_click(0, true);
+      setTimeout(function () { if (emulator) emulator.mouse_send_click(0, false); }, 80);
+    }
+  }, { passive: true });
+})();
+</script>
+</body>
+</html>
