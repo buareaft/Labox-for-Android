@@ -6,7 +6,8 @@ import android.net.Uri
 import java.io.File
 
 data class VmLaunchConfig(
-    val diskUri: Uri,
+    val mediaList: List<VmMedia> = emptyList(),
+    val virtualDisks: List<VirtualDisk> = emptyList(),
     val memoryMb: Int,
     val cpuCores: Int,
     val qemuHardware: QemuHardwareConfig = QemuHardwareConfig(),
@@ -32,13 +33,26 @@ class V86Runtime : VirtualMachineRuntime {
     }.isSuccess
 
     override fun start(context: Context, config: VmLaunchConfig) {
+        // v86 一次只能挂一个主介质（fda/cdrom/hda 三选一），取列表第一个
+        val media = config.mediaList.firstOrNull()
+        if (media == null) {
+            android.widget.Toast.makeText(context, "v86 需要至少一个镜像介质", android.widget.Toast.LENGTH_SHORT).show()
+            return
+        }
         val intent = Intent(context, V86Activity::class.java).apply {
-            putExtra(V86Activity.EXTRA_DISK_URI, config.diskUri)
+            putExtra(V86Activity.EXTRA_DISK_URI, media.uri)
             putExtra(V86Activity.EXTRA_MEMORY_MB, config.memoryMb)
-            putExtra(V86Activity.EXTRA_IMAGE_TYPE, imageTypeOf(context, config.diskUri))
+            putExtra(V86Activity.EXTRA_IMAGE_TYPE, v86ImageType(media.type))
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         }
         context.startActivity(intent)
+    }
+
+    /** v86 的 imageType 值：iso / floppy / img。 */
+    private fun v86ImageType(type: MediaType): String = when (type) {
+        MediaType.ISO -> "iso"
+        MediaType.FLOPPY -> "floppy"
+        MediaType.DISK -> "img"
     }
 
     override fun pause() {
@@ -51,27 +65,6 @@ class V86Runtime : VirtualMachineRuntime {
 
     override fun stop() {
         display?.stopEmulator()
-    }
-
-    /**
-     * 判断镜像介质类型：
-     *  - .iso → 光驱（v86 cdrom）
-     *  - <3MB → 软盘（v86 fda），如 FreeDOS 引导盘——必须挂软驱才能引导，
-     *    否则 v86 当硬盘（hda）挂载时 BIOS 找不到引导扇区，输出几行文本后黑屏
-     *  - 其他 → 硬盘（v86 hda）
-     */
-    private fun imageTypeOf(context: Context, uri: Uri): String {
-        val name = uri.lastPathSegment.orEmpty()
-        if (name.substringAfterLast('.', "").equals("iso", ignoreCase = true)) return "iso"
-        val size = runCatching {
-            context.contentResolver.query(
-                uri,
-                arrayOf(android.provider.OpenableColumns.SIZE),
-                null, null, null
-            )?.use { cursor -> if (cursor.moveToFirst()) cursor.getLong(0) else -1L }
-        }.getOrDefault(-1L)
-        if (size in 1 until 3L * 1024 * 1024) return "floppy"
-        return "img"
     }
 
     companion object {
@@ -98,7 +91,11 @@ class QemuRuntime : VirtualMachineRuntime {
     override fun start(context: Context, config: VmLaunchConfig) {
         val plan = config.qemuHardware.toQemuLaunchPlan(config.networkEnabled, config.audioEnabled)
         val intent = Intent(context, QemuDisplayActivity::class.java).apply {
-            putExtra(QemuDisplayActivity.EXTRA_DISK_URI, config.diskUri)
+            putExtra(QemuDisplayActivity.EXTRA_MEDIA_URIS, ArrayList(config.mediaList.map { it.uri.toString() }))
+            putExtra(QemuDisplayActivity.EXTRA_MEDIA_NAMES, ArrayList(config.mediaList.map { it.name }))
+            putExtra(QemuDisplayActivity.EXTRA_MEDIA_TYPES, ArrayList(config.mediaList.map { it.type.name }))
+            putExtra(QemuDisplayActivity.EXTRA_VIRTUAL_DISKS, ArrayList(config.virtualDisks.map { it.id }))
+            putExtra(QemuDisplayActivity.EXTRA_DISK_CONTROLLER, config.qemuHardware.disk.qemuValue)
             putExtra(QemuDisplayActivity.EXTRA_MEMORY_MB, config.memoryMb)
             putExtra(QemuDisplayActivity.EXTRA_CPU_CORES, config.cpuCores)
             putStringArrayListExtra(QemuDisplayActivity.EXTRA_QEMU_ARGS, ArrayList(plan.arguments))

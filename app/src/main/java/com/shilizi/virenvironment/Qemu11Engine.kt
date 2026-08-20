@@ -20,13 +20,16 @@ import java.io.IOException
  */
 class Qemu11Engine(
     context: Context,
-    private val diskUri: android.net.Uri,
+    private val mediaList: List<VmMedia>,
+    private val virtualDisks: List<VirtualDisk>,
     private val memoryMb: Int,
     private val cpuCores: Int,
     private val vncPort: Int,
     private val qmpPort: Int,
     private val qemuArgs: List<String>,
-    private val onStateChanged: (String) -> Unit
+    private val onStateChanged: (String) -> Unit,
+    /** 硬盘控制器类型（QemuHardwareConfig.disk）：ide/sata/scsi/virtio。 */
+    private val diskController: String = "ide"
 ) {
     /** 引擎只做文件/资产/ContentResolver 访问，一律用 Application 上下文，
      *  避免引擎及其后台线程把 Activity 引用拖住（泄漏根源）。 */
@@ -60,8 +63,11 @@ class Qemu11Engine(
     /** 固件目录（-L 指向） */
     val firmwareDir: File get() = File(rootDir, "firmware")
 
-    /** 磁盘文件（从 URI 复制到私有目录，QEMU 直接读文件路径） */
-    private val diskFile: File get() = File(rootDir, "disk.img")
+    /** 挂载介质目录：每个介质复制为 media<i>.img（i 为介质序号），虚拟硬盘为 vd<id>.raw */
+    val mediaDir: File get() = File(rootDir, "media")
+
+    /** 虚拟硬盘目录（app 私有，与 ViewModel 的 virtualDiskDir 一致）。 */
+    val vdDir: File get() = File(appContext.filesDir, "labox-disks")
 
     /** 解压 assets/qemu11 到私有目录（首次运行）。二进制在 nativeLibraryDir，已由系统按 ABI 解压。 */
     fun prepare() {
@@ -137,46 +143,47 @@ class Qemu11Engine(
 
     /** 从 URI 复制磁盘到私有文件（QEMU 需要真实文件路径）。
      *  file:// 直接读取（app 私有目录有权限）；content:// 走 ContentResolver（SAF）。
-     *  用 .src 标记文件记录来源 URI + 源大小：来源变化或大小不符时重新复制，
-     *  避免上一次运行的旧镜像（如 FreeDOS 软盘）被误当本次磁盘。 */
-    fun prepareDisk(): File {
-        diskFile.parentFile?.mkdirs()
-        val marker = File(diskFile.parentFile, "${diskFile.name}.src")
-        var sourceSize = -1L
-        if (diskUri.scheme == "file") {
-            sourceSize = File(diskUri.path!!).length()
-        } else {
-            runCatching {
-                appContext.contentResolver.query(diskUri, null, null, null, null)?.use { c ->
-                    if (c.moveToFirst()) {
-                        val idx = c.getColumnIndex(android.provider.OpenableColumns.SIZE)
-                        if (idx >= 0 && !c.isNull(idx)) sourceSize = c.getLong(idx)
+     *  每个介质一个槽位（media<i>.img），用 .src 标记文件记录来源 URI：
+     *  来源变化或大小不符时重新复制，避免旧镜像被误当本次磁盘。 */
+    fun prepareMedia(): List<Pair<VmMedia, File>> {
+        mediaDir.mkdirs()
+        return mediaList.mapIndexed { i, media ->
+            val dest = File(mediaDir, "media$i.img")
+            val marker = File(mediaDir, "media$i.src")
+            var sourceSize = -1L
+            if (media.uri.scheme == "file") {
+                sourceSize = File(media.uri.path!!).length()
+            } else {
+                runCatching {
+                    appContext.contentResolver.query(media.uri, null, null, null, null)?.use { c ->
+                        if (c.moveToFirst()) {
+                            val idx = c.getColumnIndex(android.provider.OpenableColumns.SIZE)
+                            if (idx >= 0 && !c.isNull(idx)) sourceSize = c.getLong(idx)
+                        }
                     }
                 }
             }
-        }
-        val sameSource = marker.exists() && marker.readText() == diskUri.toString()
-        val sameSize = sourceSize <= 0 || (diskFile.exists() && diskFile.length() == sourceSize)
-        // 记录来源扩展名（.iso 判断用）：disk.img 复制后无法从文件名得知原始介质。
-        // 在任何返回路径前设置，保证 fast path（已存在）也有值。
-        sourceExt = diskUri.lastPathSegment?.substringAfterLast('.', "")?.lowercase() ?: ""
-        if (diskFile.exists() && sameSource && sameSize) return diskFile
-        diskFile.delete()
-        marker.writeText(diskUri.toString())
-        if (diskUri.scheme == "file") {            // app 私有目录或外部存储的 file:// 直接复制
-            File(diskUri.path!!).inputStream().use { input ->
-                diskFile.outputStream().use { output -> input.copyTo(output) }
+            val sameSource = marker.exists() && marker.readText() == media.uri.toString()
+            val sameSize = sourceSize <= 0 || (dest.exists() && dest.length() == sourceSize)
+            if (!(dest.exists() && sameSource && sameSize)) {
+                dest.delete()
+                marker.writeText(media.uri.toString())
+                if (media.uri.scheme == "file") {
+                    File(media.uri.path!!).inputStream().use { input ->
+                        dest.outputStream().use { output -> input.copyTo(output) }
+                    }
+                } else {
+                    appContext.contentResolver.openInputStream(media.uri)?.use { input ->
+                        dest.outputStream().use { output -> input.copyTo(output) }
+                    } ?: throw IOException("无法打开磁盘镜像: ${media.uri}")
+                }
             }
-        } else {
-            appContext.contentResolver.openInputStream(diskUri)?.use { input ->
-                diskFile.outputStream().use { output -> input.copyTo(output) }
-            } ?: throw IOException("无法打开磁盘镜像: $diskUri")
+            media to dest
         }
-        return diskFile
     }
 
-    /** 磁盘来源扩展名（小写，无点）：prepareDisk 时记录，disk.img 复制后仍能判断原始介质。 */
-    private var sourceExt: String = ""
+    /** 磁盘来源扩展名（小写，无点）：prepareMedia 时记录，media<i>.img 复制后仍能判断原始介质。 */
+    private val sourceExts: MutableList<String> = mutableListOf()
 
     /** 复制 assets 固件到目标文件（用于 pflash 可写副本等）。 */
     private fun copyFirmware(assetName: String, dest: File) {
@@ -186,17 +193,22 @@ class Qemu11Engine(
     }
 
     /** 启动 QEMU 进程。
-     *  外部传入的 qemuArgs 可能含占位符（见 QemuHardwareConfig.toQemuLaunchPlan）：
-     *   - @DISK@：磁盘镜像路径（引擎按来源扩展名决定介质：iso→光驱，img/qcow2/vhd→硬盘，<3MB→软盘）
-     *   - @OVMF_CODE@ / @OVMF_VARS@：UEFI 固件（复制为可写副本，变量存储需可写）
-     *   - @TPM_SOCKET@：TPM 模拟器 chardev socket 路径（rootDir 下） */
+     *  外部传入的 qemuArgs 不含磁盘参数（QemuHardware 只生成非磁盘参数），
+     *  所有介质（ISO 光驱 / 硬盘镜像 / 软盘 + 虚拟硬盘）由本引擎统一挂载：
+     *   - ISO → ide-cd 光驱（可多个）
+     *   - 硬盘镜像/虚拟硬盘 → 所选硬盘控制器（IDE/SATA/SCSI/VirtIO），多块分配不同槽位
+     *   - 软盘（<3MB）→ if=floppy 软驱
+     *  @OVMF_CODE@ / @OVMF_VARS@ / @TPM_SOCKET@ 占位符在此替换 */
     fun start() {
-        val disk = prepareDisk()
-        // 介质判断优先用来源扩展名（prepareDisk 记录）：生产路径把 ISO 复制成 disk.img，
-        // 只看 disk.name 会漏掉 .iso。来源不可知（旧标记/直接入口）时按大小兜底。
-        val isIso = sourceExt == "iso"
+        val prepared = prepareMedia()
+        sourceExts.clear()
+        sourceExts.addAll(prepared.map { it.first.name.substringAfterLast('.', "").lowercase() })
+        val disk = prepared.firstOrNull()?.second
+        // 介质判断优先用来源扩展名（prepareMedia 记录）：生产路径把 ISO 复制成 media<i>.img，
+        // 只看文件名会漏掉 .iso。来源不可知（旧标记/直接入口）时按大小兜底。
+        val isIso = disk != null && sourceExts.first() == "iso"
         // 按镜像大小判断介质：<3MB 视为软盘（如 FreeDOS 引导盘），否则按扩展名
-        val isFloppy = !isIso && disk.length() < 3L * 1024 * 1024
+        val isFloppy = disk != null && !isIso && disk.length() < 3L * 1024 * 1024
         val mediaArg = when {
             isFloppy -> "if=floppy"
             isIso -> "media=cdrom,if=ide"
@@ -224,43 +236,20 @@ class Qemu11Engine(
             "-qmp", "tcp:127.0.0.1:$qmpPort,server=on,wait=off",
             "-D", File(rootDir, "qemu.log").absolutePath
         )
-        // 外部参数含 @DISK@（toQemuLaunchPlan 生成的 -drive if=none 挂载）时不重复挂盘
-        val diskInArgs = qemuArgs.any { it.contains("@DISK@") }
-        if (!diskInArgs) {
-            cmd.add("-drive")
-            cmd.add("file=${disk.absolutePath},format=raw,$mediaArg")
-        }
+        // 挂载所有介质（ISO 光驱 + 硬盘镜像 + 软盘）与虚拟硬盘。
+        // QemuHardware 不再生成磁盘参数，这里统一生成；多条 -drive/-device 显式分配槽位。
+        cmd.addAll(buildDiskArguments(prepared))
         cmd.addAll(qemuArgs.map { arg ->
-            var a = arg.replace("@DISK@", disk.absolutePath)
-                .replace("@OVMF_CODE@", ovmfCode.absolutePath)
+            var a = arg.replace("@OVMF_CODE@", ovmfCode.absolutePath)
                 .replace("@OVMF_VARS@", ovmfVars.absolutePath)
                 .replace("@TPM_SOCKET@", File(rootDir, "swtpm.sock").absolutePath)
-            // ISO 安装镜像必须挂光驱设备（ide-cd），否则 UEFI 无法引导安装盘
-            if (isIso && a.contains("drive=disk0") && a.startsWith("-device")) {
-                a = a.replace("ide-hd", "ide-cd")
-            }
             a
         })
-        // TPM 兜底：Termux QEMU 无 swtpm 进程，TPM 参数必然启动失败。
-        // 若外部参数仍带 TPM（旧缓存/直接构造），过滤掉相关参数保持可启动。
-        if (cmd.any { it.contains("chrtpm") || it.contains("tpm-tis") || it.contains("@TPM_SOCKET@") }) {
-            Log.w(TAG, "检测到 TPM 参数但 swtpm 不可用，已移除")
-            val tpmKeywords = setOf("chrtpm", "tpm0", "tpm-tis")
-            cmd.removeAll { arg ->
-                arg.startsWith("-") && tpmKeywords.any { arg.contains(it) }
-            }
-            // 移除紧随的 -chardev/-tpmdev 值行
-            cmd.removeAll { arg -> arg.contains("swtpm.sock") }
-        }
         // 软盘镜像（<3MB，如 FreeDOS 引导盘）必须挂为软驱并从 A 盘引导。
-        // 生产路径 QemuHardware 默认把 @DISK@ 挂成 IDE 硬盘（-device ide-hd,drive=disk0），
-        // 若不改成软驱，QEMU 从 A 盘找不到可引导设备 → 黑屏 / "No bootable device"。
-        // QEMU 后出现的 -boot 覆盖前面的，追加在末尾确保 order=a 生效。
+        // buildDiskArguments 已把软盘挂为 if=floppy；追加 -boot order=a 确保软盘优先。
         if (isFloppy) {
-            // 1) 移除 QemuHardware 生成的磁盘设备行：QEMU 参数数组里 "-device" 与设备值
-            //    （ide-hd,drive=disk0 / scsi-hd,drive=disk0 / virtio-blk-pci,drive=disk0）
-            //    是两个独立元素，需按索引把标志和值成对删除，否则残留的
-            //    "-device ide-hd,drive=disk0" 会因找不到 drive=disk0 让 QEMU 直接退出。
+            // 移除 QemuHardware 可能残留的磁盘设备行：参数数组里 "-device" 与设备值
+            // 是两个独立元素，需按索引把标志和值成对删除。
             val filtered = mutableListOf<String>()
             var i = 0
             while (i < cmd.size) {
@@ -273,15 +262,19 @@ class Qemu11Engine(
             }
             cmd.clear()
             cmd.addAll(filtered)
-            // 2) 把 -drive 值行改为挂软驱（if=floppy）；找不到（直接入口未生成 @DISK@）则追加
-            val driveValueIdx = cmd.indexOfFirst { it.startsWith("file=${disk.absolutePath}") }
-            if (driveValueIdx >= 0) {
-                cmd[driveValueIdx] = "file=${disk.absolutePath},format=raw,if=floppy"
-            } else {
-                cmd.addAll(listOf("-drive", "file=${disk.absolutePath},format=raw,if=floppy"))
-            }
-            // 3) 软盘优先引导
+            // 软盘优先引导
             cmd.addAll(listOf("-boot", "order=a"))
+        }
+        // TPM 兜底：Termux QEMU 无 swtpm 进程，TPM 参数必然启动失败。
+        // 若外部参数仍带 TPM（旧缓存/直接构造），过滤掉相关参数保持可启动。
+        if (cmd.any { it.contains("chrtpm") || it.contains("tpm-tis") || it.contains("@TPM_SOCKET@") }) {
+            Log.w(TAG, "检测到 TPM 参数但 swtpm 不可用，已移除")
+            val tpmKeywords = setOf("chrtpm", "tpm0", "tpm-tis")
+            cmd.removeAll { arg ->
+                arg.startsWith("-") && tpmKeywords.any { arg.contains(it) }
+            }
+            // 移除紧随的 -chardev/-tpmdev 值行
+            cmd.removeAll { arg -> arg.contains("swtpm.sock") }
         }
         Log.i(TAG, "QEMU 11 启动 (abi=$abi, uefi=$uefiRequested): $cmd")
 
@@ -335,6 +328,92 @@ class Qemu11Engine(
     }
 
     fun isRunning(): Boolean = process?.isAlive == true
+
+    /**
+     * 为所有介质与虚拟硬盘生成 QEMU 挂载参数。
+     *
+     * 槽位策略（保证多盘共存且 Windows 能识别）：
+     *  - IDE/i440FX（PIIX3）：bus ide.0（primary）/ ide.1（secondary），每通道 unit 0/1。
+     *    光驱优先 primary master，硬盘副通道，共 4 槽。
+     *  - SATA/Q35（ich9-ahci）：总线 ide.0~ide.5（6 个 AHCI 端口）。
+     *  - SCSI：lsi53c895a 总线，scsi-hd/scsi-cd 依次分配 unit。
+     *  - VirtIO：virtio-blk-pci 每块一个 PCI 设备。
+     *  - 软盘：if=floppy（fda），只能挂一个。
+     *  ISO 一律挂光驱（ide-cd/scsi-cd），硬盘镜像/虚拟硬盘挂所选控制器。
+     *  @return 追加到 cmd 的参数列表（-drive/-device 成对）
+     */
+    private fun buildDiskArguments(prepared: List<Pair<VmMedia, File>>): List<String> {
+        val args = mutableListOf<String>()
+        // Q35（SATA）走 ich9-ahci，总线名仍是 ide.N；i440FX 走 PIIX3 的 ide.0/ide.1
+        val isQ35 = qemuArgs.any { it.contains("q35") }
+        val ideBusCount = if (isQ35) 6 else 2
+
+        // ---- 虚拟硬盘：挂到所选控制器 ----
+        val vdDrives = mutableListOf<String>()
+        virtualDisks.forEachIndexed { vdIdx, vd ->
+            val file = File(vdDir, "${vd.id}.raw")
+            if (!file.isFile) return@forEachIndexed
+            val id = "vd$vdIdx"
+            args += listOf("-drive", "file=${file.absolutePath},format=raw,if=none,id=$id")
+            vdDrives += id
+        }
+
+        // ---- 外部镜像：ISO→光驱，其余→硬盘 ----
+        val isoDrives = mutableListOf<String>()
+        val hdDrives = mutableListOf<String>()
+        prepared.forEachIndexed { i, (media, file) ->
+            val type = media.type
+            val id = "disk$i"
+            when (type) {
+                MediaType.ISO -> {
+                    args += listOf("-drive", "file=${file.absolutePath},format=raw,if=none,id=$id,media=cdrom")
+                    isoDrives += id
+                }
+                MediaType.FLOPPY -> {
+                    // 软盘挂 fda（QEMU 只支持一个软驱）
+                    args += listOf("-drive", "file=${file.absolutePath},format=raw,if=floppy")
+                }
+                MediaType.DISK -> {
+                    args += listOf("-drive", "file=${file.absolutePath},format=raw,if=none,id=$id")
+                    hdDrives += id
+                }
+            }
+        }
+
+        // IDE 系（IDE/SATA）：光驱和硬盘共用 ide.N 总线，槽位顺序分配。
+        // 光驱优先低槽位（primary master），保证 Windows 从 CD 引导安装。
+        val ideLike = diskController == "ide" || diskController == "sata"
+        if (ideLike) {
+            var bus = 0
+            var unit = 0
+            fun nextSlot(): String {
+                val slot = "ide.$bus,unit=$unit"
+                unit++
+                if (unit >= 2) { unit = 0; bus++ }
+                if (bus >= ideBusCount) bus = ideBusCount - 1
+                return slot
+            }
+            isoDrives.forEach { id -> args += listOf("-device", "ide-cd,drive=$id,bus=${nextSlot()}") }
+            (vdDrives + hdDrives).forEach { id -> args += listOf("-device", "ide-hd,drive=$id,bus=${nextSlot()}") }
+            return args
+        }
+        when (diskController) {
+            "scsi" -> {
+                args += listOf("-device", "lsi53c895a,id=scsi0")
+                isoDrives.forEachIndexed { idx, id ->
+                    args += listOf("-device", "scsi-cd,drive=$id,bus=scsi0.0,unit=$idx")
+                }
+                (vdDrives + hdDrives).forEachIndexed { idx, id ->
+                    args += listOf("-device", "scsi-hd,drive=$id,bus=scsi0.0,unit=$idx")
+                }
+            }
+            else -> { // virtio
+                isoDrives.forEach { id -> args += listOf("-device", "virtio-blk-pci,drive=$id") }
+                (vdDrives + hdDrives).forEach { id -> args += listOf("-device", "virtio-blk-pci,drive=$id") }
+            }
+        }
+        return args
+    }
 
     // ---------- 输入（QMP input-send-event）----------
     // 所有输入统一投递到后台 input 线程：QMP 是网络 I/O，绝不上主线程

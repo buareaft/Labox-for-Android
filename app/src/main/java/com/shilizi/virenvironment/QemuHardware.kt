@@ -169,7 +169,8 @@ fun QemuHardwareConfig.validate(profile: WindowsProfile): List<QemuValidationIss
     }
 }
 
-/** Builds documented QEMU arguments. Native code replaces @DISK@ and firmware/TPM placeholders. */
+/** Builds documented QEMU arguments. Disk mounting (ISO/HDD/floppy) is handled by Qemu11Engine,
+ *  so this only generates non-disk args. Native code replaces firmware/TPM placeholders. */
 fun QemuHardwareConfig.toQemuLaunchPlan(networkEnabled: Boolean, audioEnabled: Boolean): QemuLaunchPlan {
     val requiredFiles = mutableSetOf<String>()
     // Termux QEMU 11 的机型名必须带版本号（pc-i440fx-9.2 / pc-q35-9.2），
@@ -183,15 +184,8 @@ fun QemuHardwareConfig.toQemuLaunchPlan(networkEnabled: Boolean, audioEnabled: B
     addAll(listOf("-machine", machineArg, "-cpu", cpu.qemuValue))
     addAll(listOf("-vga", video.qemuValue, "-boot", "order=${bootOrder.qemuValue}"))
     addAll(listOf("-rtc", "base=${if (rtcLocalTime) "localtime" else "utc"}"))
-    // 磁盘：@DISK@ 由引擎替换。ISO 装光驱，IMG/QCOW2/VHD 装硬盘。
-    // format 用 raw（引擎已把镜像复制成 raw 格式）
-    addAll(listOf("-drive", "file=@DISK@,if=none,id=disk0,format=raw"))
-    when (disk) {
-        QemuDisk.IDE -> addAll(listOf("-device", "ide-hd,drive=disk0"))
-        QemuDisk.SATA -> addAll(listOf("-device", "ide-hd,drive=disk0")) // q35 下 ide-hd 自动挂 SATA
-        QemuDisk.SCSI -> addAll(listOf("-device", "lsi53c895a,id=scsi0", "-device", "scsi-hd,drive=disk0,bus=scsi0.0"))
-        QemuDisk.VIRTIO -> addAll(listOf("-device", "virtio-blk-pci,drive=disk0"))
-    }
+    // 注意：磁盘挂载（光驱/硬盘/软盘）由 Qemu11Engine 按介质列表统一生成，
+    // 这里不再输出 -drive/-device 磁盘参数，避免与引擎的多介质挂载冲突。
     if (firmware == QemuFirmware.UEFI) {
         requiredFiles += "OVMF_CODE.fd"
         requiredFiles += "OVMF_VARS.fd"

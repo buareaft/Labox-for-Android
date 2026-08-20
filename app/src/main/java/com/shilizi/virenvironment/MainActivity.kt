@@ -30,10 +30,13 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Stop
+import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.DropdownMenuItem
@@ -111,7 +114,7 @@ class MainActivity : ComponentActivity() {
                         )?.use { cursor ->
                             if (cursor.moveToFirst()) cursor.getString(0) else null
                         } ?: getString(R.string.default_disk_name)
-                        vmViewModel.selectDisk(it, name)
+                        vmViewModel.addMedia(it, name)
                     }
                 }
 
@@ -122,6 +125,9 @@ class MainActivity : ComponentActivity() {
                     onSelectEngine = vmViewModel::selectEngine,
                     onQemuHardwareChange = vmViewModel::setQemuHardware,
                     onSelectDisk = { imagePicker.launch(arrayOf("application/octet-stream", "application/x-iso9660-image", "*/*")) },
+                    onRemoveMedia = vmViewModel::removeMedia,
+                    onCreateVirtualDisk = { name, sizeMb -> vmViewModel.createVirtualDisk(name, sizeMb) },
+                    onDeleteVirtualDisk = vmViewModel::deleteVirtualDisk,
                     onSelectRecentImage = { recent ->
                         val uri = Uri.parse(recent.uri)
                         runCatching {
@@ -176,6 +182,9 @@ private fun LaboxScreen(
     onSelectEngine: (VmEngine) -> Unit,
     onQemuHardwareChange: (QemuHardwareConfig) -> Unit,
     onSelectDisk: () -> Unit,
+    onRemoveMedia: (Uri) -> Unit,
+    onCreateVirtualDisk: (String, Int) -> Unit,
+    onDeleteVirtualDisk: (String) -> Unit,
     onSelectRecentImage: (RecentImage) -> Unit,
     onMemoryChange: (Int) -> Unit,
     onCpuChange: (Int) -> Unit,
@@ -218,6 +227,9 @@ private fun LaboxScreen(
                         onSelectEngine,
                         onQemuHardwareChange,
                         onSelectDisk,
+                        onRemoveMedia,
+                        onCreateVirtualDisk,
+                        onDeleteVirtualDisk,
                         onSelectRecentImage,
                         onMemoryChange,
                         onCpuChange,
@@ -237,6 +249,9 @@ private fun LaboxScreen(
                         onSelectEngine,
                         onQemuHardwareChange,
                         onSelectDisk,
+                        onRemoveMedia,
+                        onCreateVirtualDisk,
+                        onDeleteVirtualDisk,
                         onSelectRecentImage,
                         onMemoryChange,
                         onCpuChange,
@@ -258,6 +273,9 @@ private fun ConfigurationPanel(
     onSelectEngine: (VmEngine) -> Unit,
     onQemuHardwareChange: (QemuHardwareConfig) -> Unit,
     onSelectDisk: () -> Unit,
+    onRemoveMedia: (Uri) -> Unit,
+    onCreateVirtualDisk: (String, Int) -> Unit,
+    onDeleteVirtualDisk: (String) -> Unit,
     onSelectRecentImage: (RecentImage) -> Unit,
     onMemoryChange: (Int) -> Unit,
     onCpuChange: (Int) -> Unit,
@@ -299,22 +317,76 @@ private fun ConfigurationPanel(
             }
 
             Text(stringResource(R.string.boot_image), style = MaterialTheme.typography.labelSmall, color = Color(0xFF8B949C))
+            // 已挂载介质列表（ISO/硬盘镜像/软盘，可多个）
+            state.mediaList.forEach { media ->
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        text = mediaTypeLabel(media.type),
+                        color = Accent,
+                        fontSize = 11.sp,
+                        modifier = Modifier.padding(end = 6.dp)
+                    )
+                    Text(
+                        text = media.name,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = Color(0xFFC8D0D6),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f)
+                    )
+                    if (state.status == VmStatus.STOPPED) {
+                        IconButton(onClick = { onRemoveMedia(media.uri) }, modifier = Modifier.size(24.dp)) {
+                            Icon(Icons.Default.Close, contentDescription = stringResource(R.string.remove_media), tint = Color(0xFF8B949C), modifier = Modifier.size(16.dp))
+                        }
+                    }
+                }
+            }
             Button(
                 onClick = onSelectDisk,
-                enabled = state.status == VmStatus.STOPPED,
+                enabled = state.status == VmStatus.STOPPED && state.mediaList.size < 4,
                 modifier = Modifier.fillMaxWidth(),
                 colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2A3035))
             ) {
                 Icon(Icons.Default.Add, contentDescription = null)
                 Spacer(Modifier.width(8.dp))
-                Text(state.diskName ?: stringResource(R.string.choose_disk_image), maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text(stringResource(R.string.add_media), maxLines = 1, overflow = TextOverflow.Ellipsis)
             }
+
+            // 虚拟硬盘（VMware 风格：可创建/删除，QEMU 挂为硬盘）
+            Text(stringResource(R.string.virtual_disks), style = MaterialTheme.typography.labelSmall, color = Color(0xFF8B949C))
+            state.virtualDisks.forEach { vd ->
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        text = vd.name,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = Color(0xFFC8D0D6),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f)
+                    )
+                    Text(
+                        text = stringResource(R.string.disk_size_value, vd.sizeMb),
+                        color = Accent,
+                        fontSize = 11.sp,
+                        modifier = Modifier.padding(end = 6.dp)
+                    )
+                    if (state.status == VmStatus.STOPPED) {
+                        IconButton(onClick = { onDeleteVirtualDisk(vd.id) }, modifier = Modifier.size(24.dp)) {
+                            Icon(Icons.Default.Delete, contentDescription = stringResource(R.string.delete_virtual_disk), tint = Color(0xFF8B949C), modifier = Modifier.size(16.dp))
+                        }
+                    }
+                }
+            }
+            VirtualDiskCreator(
+                enabled = state.status == VmStatus.STOPPED,
+                onCreate = onCreateVirtualDisk
+            )
 
             // 最近镜像快捷列表（SharedPreferences 记忆，点击直接选中）
             if (recentImages.isNotEmpty()) {
                 Text(stringResource(R.string.recent_images), style = MaterialTheme.typography.labelSmall, color = Color(0xFF8B949C))
                 recentImages.forEach { recent ->
-                    val selected = state.diskUri?.toString() == recent.uri
+                    val selected = state.mediaList.any { it.uri.toString() == recent.uri }
                     TextButton(
                         onClick = { onSelectRecentImage(recent) },
                         enabled = state.status == VmStatus.STOPPED,
@@ -391,7 +463,8 @@ private fun ConsolePanel(
     // 未选磁盘或 QEMU 配置有阻断性错误时禁止启动（避免无效操作，错误由配置面板的红字提示）
     val invalidQemuConfig = state.engine == VmEngine.QEMU &&
         state.qemuHardware.validate(state.windowsProfile).any { it.blocksLaunch }
-    val canStart = state.status == VmStatus.STOPPED && state.diskUri != null && !invalidQemuConfig
+    val hasMedia = state.mediaList.isNotEmpty() || state.virtualDisks.isNotEmpty()
+    val canStart = state.status == VmStatus.STOPPED && hasMedia && !invalidQemuConfig
     Surface(modifier = modifier, color = Panel, shape = RoundedCornerShape(8.dp)) {
         Column(Modifier.fillMaxSize()) {
             Row(
@@ -410,7 +483,7 @@ private fun ConsolePanel(
                         Icon(Icons.Default.Pause, contentDescription = stringResource(R.string.pause))
                     }
                 }
-                IconButton(onClick = onStop, enabled = state.status != VmStatus.STOPPED && state.diskUri != null) {
+                IconButton(onClick = onStop, enabled = state.status != VmStatus.STOPPED && hasMedia) {
                     Icon(Icons.Default.Stop, contentDescription = stringResource(R.string.stop))
                 }
             }
@@ -457,6 +530,79 @@ private fun ConsoleContent(state: VmUiState) {
                 color = Color(0xFF798188)
             )
         }
+    }
+}
+
+@Composable
+private fun mediaTypeLabel(type: MediaType): String = when (type) {
+    MediaType.ISO -> "ISO"
+    MediaType.DISK -> "HDD"
+    MediaType.FLOPPY -> "FDD"
+}
+
+/** 虚拟硬盘创建器：输入名称和大小，VMware 风格创建空 raw 磁盘。 */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun VirtualDiskCreator(
+    enabled: Boolean,
+    onCreate: (String, Int) -> Unit
+) {
+    var showDialog by remember { mutableStateOf(false) }
+    var name by remember { mutableStateOf("") }
+    var sizeMb by remember { mutableStateOf(4096) }
+    Button(
+        onClick = { showDialog = true },
+        enabled = enabled,
+        modifier = Modifier.fillMaxWidth(),
+        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2A3035))
+    ) {
+        Icon(Icons.Default.Add, contentDescription = null)
+        Spacer(Modifier.width(8.dp))
+        Text(stringResource(R.string.create_virtual_disk))
+    }
+    if (showDialog) {
+        AlertDialog(
+            onDismissRequest = { showDialog = false },
+            title = { Text(stringResource(R.string.create_virtual_disk)) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    OutlinedTextField(
+                        value = name,
+                        onValueChange = { name = it },
+                        label = { Text(stringResource(R.string.disk_name)) },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    Column {
+                        Row(Modifier.fillMaxWidth()) {
+                            Text(stringResource(R.string.disk_size))
+                            Spacer(Modifier.weight(1f))
+                            Text(stringResource(R.string.disk_size_value, sizeMb), color = Accent)
+                        }
+                        Slider(
+                            value = sizeMb.toFloat(),
+                            onValueChange = { sizeMb = (it / 512).roundToInt() * 512 },
+                            valueRange = 512f..65536f,
+                            steps = 126
+                        )
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        val finalName = name.ifBlank { "Virtual Disk" }
+                        onCreate(finalName, sizeMb)
+                        showDialog = false
+                        name = ""
+                        sizeMb = 4096
+                    }
+                ) { Text(stringResource(R.string.create)) }
+            },
+            dismissButton = {
+                TextButton(onClick = { showDialog = false }) { Text(stringResource(R.string.cancel)) }
+            }
+        )
     }
 }
 
@@ -769,6 +915,10 @@ private fun LaboxTheme(content: @Composable () -> Unit) {
 @Composable
 private fun LaboxPreview() {
     LaboxTheme {
-        LaboxScreen(VmUiState(), emptyList(), {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})
+        LaboxScreen(
+            VmUiState(), emptyList(),
+            {}, {}, {}, {}, {}, { _: String, _: Int -> }, {},
+            {}, {}, {}, {}, {}, {}, {}, {}
+        )
     }
 }

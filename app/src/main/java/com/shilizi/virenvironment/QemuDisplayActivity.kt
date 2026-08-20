@@ -105,12 +105,23 @@ class QemuDisplayActivity : ComponentActivity() {
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         enableImmersiveMode()
 
-        val diskUri: Uri? = if (android.os.Build.VERSION.SDK_INT >= 33) {
-            intent.getParcelableExtra(EXTRA_DISK_URI, Uri::class.java)
-        } else {
-            @Suppress("DEPRECATION")
-            intent.getParcelableExtra(EXTRA_DISK_URI)
-        } ?: intent.getStringExtra(EXTRA_DISK_URI)?.let { Uri.parse(it) }
+        // 多介质：URIs/names/types 三个平行列表 + 虚拟硬盘 id 列表
+        val mediaUris = intent.getStringArrayListExtra(EXTRA_MEDIA_URIS) ?: emptyList()
+        val mediaNames = intent.getStringArrayListExtra(EXTRA_MEDIA_NAMES) ?: emptyList()
+        val mediaTypes = intent.getStringArrayListExtra(EXTRA_MEDIA_TYPES) ?: emptyList()
+        val mediaList = mediaUris.mapIndexedNotNull { i, uriStr ->
+            val uri = runCatching { Uri.parse(uriStr) }.getOrNull() ?: return@mapIndexedNotNull null
+            val name = mediaNames.getOrNull(i) ?: uri.lastPathSegment ?: uriStr
+            val type = runCatching { MediaType.valueOf(mediaTypes.getOrNull(i) ?: "DISK") }.getOrDefault(MediaType.DISK)
+            VmMedia(uri, name, type)
+        }
+        val vdIds = intent.getStringArrayListExtra(EXTRA_VIRTUAL_DISKS) ?: emptyList()
+        val virtualDisks = vdIds.mapNotNull { id ->
+            val f = File(File(filesDir, "labox-disks"), "$id.raw")
+            if (!f.isFile) null else VirtualDisk(id, id, (f.length() / 1048576L).toInt().coerceAtLeast(1))
+        }
+        // 硬盘控制器类型（ide/sata/scsi/virtio），与 QemuHardwareConfig.disk.qemuValue 对应
+        val diskController = intent.getStringExtra(EXTRA_DISK_CONTROLLER) ?: "ide-hd"
         val memoryMb = intent.getIntExtra(EXTRA_MEMORY_MB, 2048)
         val cpuCores = intent.getIntExtra(EXTRA_CPU_CORES, 2)
 
@@ -128,16 +139,23 @@ class QemuDisplayActivity : ComponentActivity() {
         val vncPort = findFreePort()
         val qmpPort = findFreePort()
 
-        if (diskUri != null) {
+        if (mediaList.isNotEmpty()) {
             val eng = Qemu11Engine(
                 context = this,
-                diskUri = diskUri,
+                mediaList = mediaList,
+                virtualDisks = virtualDisks,
                 memoryMb = memoryMb,
                 cpuCores = cpuCores,
                 vncPort = vncPort,
                 qmpPort = qmpPort,
                 qemuArgs = planArgs,
-                onStateChanged = { msg -> runOnUiThread { statusText.value = msg } }
+                onStateChanged = { msg -> runOnUiThread { statusText.value = msg } },
+                diskController = when (diskController) {
+                    "sata" -> "sata"
+                    "scsi-hd" -> "scsi"
+                    "virtio-blk-pci" -> "virtio"
+                    else -> "ide"
+                }
             )
             engine = eng
             // QEMU 进程异常退出（崩溃/被杀）时：界面显示提示并退出，避免停在死机画面
@@ -184,7 +202,7 @@ class QemuDisplayActivity : ComponentActivity() {
                 }
             }, "labox-qemu-launch").start()
         } else {
-            // 无磁盘镜像（异常入口）：不能启动虚拟机，直接退出并提示
+            // 无介质（异常入口）：不能启动虚拟机，直接退出并提示
             android.widget.Toast.makeText(this, "未选择磁盘镜像，无法启动虚拟机", android.widget.Toast.LENGTH_SHORT).show()
             finish()
         }
@@ -734,7 +752,11 @@ class QemuDisplayActivity : ComponentActivity() {
 
     companion object {
         private const val TAG = "LaboxQemu"
-        const val EXTRA_DISK_URI = "disk_uri"
+        const val EXTRA_MEDIA_URIS = "media_uris"
+        const val EXTRA_MEDIA_NAMES = "media_names"
+        const val EXTRA_MEDIA_TYPES = "media_types"
+        const val EXTRA_VIRTUAL_DISKS = "virtual_disks"
+        const val EXTRA_DISK_CONTROLLER = "disk_controller"
         const val EXTRA_MEMORY_MB = "memory_mb"
         const val EXTRA_CPU_CORES = "cpu_cores"
         const val EXTRA_QEMU_ARGS = "qemu_args"
