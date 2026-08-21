@@ -33,16 +33,22 @@ class V86Runtime : VirtualMachineRuntime {
     }.isSuccess
 
     override fun start(context: Context, config: VmLaunchConfig) {
-        // v86 一次只能挂一个主介质（fda/cdrom/hda 三选一），取列表第一个
+        // v86 一次只能挂一个主介质（fda/cdrom/hda 三选一），取列表第一个；
+        // 虚拟硬盘（raw 文件）额外挂为 hda，让 XP 安装/运行有目标磁盘
         val media = config.mediaList.firstOrNull()
         if (media == null) {
             android.widget.Toast.makeText(context, "v86 需要至少一个镜像介质", android.widget.Toast.LENGTH_SHORT).show()
             return
         }
+        val hda = config.virtualDisks.firstOrNull()?.let { vd ->
+            val file = java.io.File(context.filesDir, "labox-disks/${vd.id}.raw")
+            if (file.isFile) file.absolutePath else null
+        }
         val intent = Intent(context, V86Activity::class.java).apply {
             putExtra(V86Activity.EXTRA_DISK_URI, media.uri)
             putExtra(V86Activity.EXTRA_MEMORY_MB, config.memoryMb)
             putExtra(V86Activity.EXTRA_IMAGE_TYPE, v86ImageType(media.type))
+            hda?.let { putExtra(V86Activity.EXTRA_HDA_PATH, it) }
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         }
         context.startActivity(intent)

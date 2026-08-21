@@ -30,6 +30,7 @@ class V86Activity : ComponentActivity() {
     private var server: V86HttpServer? = null
     private var imageUri: Uri? = null
     private var diskPath: String? = null
+    private var hdaPath: String? = null
     private var paused = false
     private var keyboardVisible = false
     private var finished = false
@@ -41,10 +42,16 @@ class V86Activity : ComponentActivity() {
         requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
         enableImmersiveMode()
 
-        val memoryMb = intent.getIntExtra(EXTRA_MEMORY_MB, 256).coerceIn(64, 512)
         val imageType = intent.getStringExtra(EXTRA_IMAGE_TYPE) ?: "iso"
+        // v86 上限 512MB；软盘引导的轻量系统（DOS/FreeDOS）128MB 足够，
+        // 避免为小系统分配 512MB WASM 内存拖慢启动
+        val memoryMb = when (imageType) {
+            "floppy" -> intent.getIntExtra(EXTRA_MEMORY_MB, 256).coerceIn(64, 128)
+            else -> intent.getIntExtra(EXTRA_MEMORY_MB, 256).coerceIn(64, 512)
+        }
         imageUri = intent.getParcelableExtra(EXTRA_DISK_URI)
         diskPath = intent.getStringExtra(EXTRA_DISK_PATH)
+        hdaPath = intent.getStringExtra(EXTRA_HDA_PATH)
 
         V86Runtime.display = this
         buildUi()
@@ -132,7 +139,7 @@ class V86Activity : ComponentActivity() {
         }
 
     private fun startWebView(memoryMb: Int, imageType: String) {
-        val server = V86HttpServer(this, imageUri, diskPath)
+        val server = V86HttpServer(this, imageUri, diskPath, hdaPath)
         this.server = server
         server.start()
         val baseUrl = "http://127.0.0.1:${server.port}"
@@ -164,7 +171,8 @@ class V86Activity : ComponentActivity() {
         }
 
         val autostopMs = intent.getIntExtra(EXTRA_AUTOSTOP_MS, 0)
-        val url = "$baseUrl/assets/v86/index.html?memory=$memoryMb&image=$baseUrl/disk&type=$imageType" +
+        val hdaParam = if (!hdaPath.isNullOrBlank()) "&hda=$baseUrl/hda" else ""
+        val url = "$baseUrl/assets/v86/index.html?memory=$memoryMb&image=$baseUrl/disk&type=$imageType$hdaParam" +
             (if (autostopMs > 0) "&autostop_ms=$autostopMs" else "")
         webView.loadUrl(url)
     }
@@ -174,9 +182,13 @@ class V86Activity : ComponentActivity() {
         webView.postDelayed({
             if (finished) return@postDelayed
             webView.evaluateJavascript(
-                "JSON.stringify({status: window.laboxVmStatus || 'n/a', title: document.title, v86: typeof V86Starter, emu: typeof window.laboxEmulator})",
+                "JSON.stringify({status: window.laboxVmStatus || 'n/a', title: document.title, v86: typeof V86Starter, emu: typeof window.laboxEmulator, canvas: (window.laboxCanvasInfo ? laboxCanvasInfo() : 'na')})",
                 { value ->
                     val status = parseStatus(value)
+                    val canvasInfo = Regex("\"canvas\":\"([^\"]*)\"").find(value ?: "")?.groupValues?.get(1)
+                    if (canvasInfo != null && canvasInfo != "none" && canvasInfo != "na") {
+                        Log.i(TAG, "canvas: $canvasInfo")
+                    }
                     if (status != null) {
                         Log.i(TAG, "v86 status: $status")
                         when (status) {
@@ -291,6 +303,7 @@ class V86Activity : ComponentActivity() {
         private const val TAG = "LaboxV86"
         const val EXTRA_DISK_URI = "disk_uri"
         const val EXTRA_DISK_PATH = "disk_path"
+        const val EXTRA_HDA_PATH = "hda_path"
         const val EXTRA_MEMORY_MB = "memory_mb"
         const val EXTRA_IMAGE_TYPE = "image_type"
         const val EXTRA_AUTOSTOP_MS = "autostop_ms"

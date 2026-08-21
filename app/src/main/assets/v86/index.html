@@ -6,8 +6,7 @@
 <title>LABOX · v86</title>
 <style>
   html, body { margin: 0; padding: 0; height: 100%; background: #000; overflow: hidden; }
-  #screen { position: fixed; top: 0; left: 0; right: 0; bottom: 0; }
-  #screen canvas { image-rendering: pixelated; }
+  #screen { position: fixed; top: 0; left: 0; right: 0; bottom: 0; display: flex; align-items: center; justify-content: center; background: #000; }
   #kb {
     position: fixed; left: 0; right: 0; bottom: 0; height: 120px; display: none;
     background: #1c1f22; color: #e8e8e8; font-size: 16px; padding: 8px;
@@ -37,6 +36,7 @@ window.onerror = function (message, source, line, col, error) {
   var memoryMb = Math.min(parseInt(params.get("memory") || "256", 10) || 256, 512);
   var imagePath = params.get("image") || "/images/disk";
   var imageType = params.get("type") || "iso";
+  var hdaPath = params.get("hda") || "";
   var emulator = null;
 
   function fail(message) {
@@ -67,6 +67,11 @@ window.onerror = function (message, source, line, col, error) {
   } else {
     options.hda = { url: imagePath };
   }
+  // 虚拟硬盘：与 cdrom/fda 共存，作为第二块磁盘（XP 安装目标）。
+  // 注意 v86 里 hda 是唯一的引导磁盘，若主介质是 cdrom，hda 仅作数据盘。
+  if (hdaPath && (imageType === "iso" || imageType === "floppy")) {
+    options.hda = { url: hdaPath };
+  }
 
   window.laboxEmulator = null;
   window.laboxError = "";
@@ -77,6 +82,34 @@ window.onerror = function (message, source, line, col, error) {
       emulator = new V86(options);
       window.laboxEmulator = emulator;
       document.title = "labox-v86-ok";
+      // 画面等比缩放：canvas 保持分辨率长宽比，fit 到屏幕（留黑边居中）
+      var screenEl2 = document.getElementById("screen");
+      function fitCanvas() {
+        var canvas = screenEl2.querySelector("canvas");
+        if (!canvas || !canvas.width || !canvas.height) return;
+        var cw = window.innerWidth, ch = window.innerHeight;
+        var scale = Math.min(cw / canvas.width, ch / canvas.height);
+        canvas.style.width = Math.floor(canvas.width * scale) + "px";
+        canvas.style.height = Math.floor(canvas.height * scale) + "px";
+        console.log("fitCanvas size=" + canvas.width + "x" + canvas.height +
+          " -> " + canvas.style.width + "x" + canvas.style.height +
+          " win=" + cw + "x" + ch);
+      }
+      window.addEventListener("resize", fitCanvas);
+      // v86 渲染后 canvas 尺寸确定，等首帧后应用缩放（每 500ms 轮询 2 分钟）
+      var tries = 0;
+      var fitTimer = setInterval(function () {
+        fitCanvas();
+        if (++tries > 240) clearInterval(fitTimer);
+      }, 500);
+      // Android 端轮询可读的 canvas 尺寸（用于画面比例校验）
+      window.laboxCanvasInfo = function () {
+        var canvas = screenEl2.querySelector("canvas");
+        if (!canvas) return "none";
+        return canvas.width + "x" + canvas.height +
+          " style=" + canvas.style.width + "x" + canvas.style.height +
+          " win=" + window.innerWidth + "x" + window.innerHeight;
+      };
     } catch (error) {
       document.title = "labox-v86-fail: " + error;
       fail("v86 初始化失败: " + error);

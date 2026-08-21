@@ -2,6 +2,7 @@ package com.shilizi.virenvironment
 
 import android.content.Context
 import android.net.Uri
+import android.util.Log
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
 import java.io.File
@@ -28,13 +29,15 @@ import java.util.concurrent.locks.ReentrantLock
  *
  * 支持：
  * - GET /assets/v86/（静态文件：js/wasm/bin 带正确 MIME）
- * - GET /disk（流式提供磁盘镜像：SAF Uri 或本地文件路径）
+ * - GET /disk（流式提供主介质镜像：SAF Uri 或本地文件路径）
+ * - GET /hda（流式提供虚拟硬盘镜像：本地 raw 文件）
  * - Range 请求（v86 读 ISO 需要，避免整体载入内存）
  */
 internal class V86HttpServer(
     private val context: Context,
     private val diskUri: Uri?,
-    private val diskPath: String?
+    private val diskPath: String?,
+    private val hdaPath: String? = null
 ) {
     private val serverSocket = ServerSocket(0, 50, InetAddress.getByName("127.0.0.1"))
     private val executor: ExecutorService = Executors.newCachedThreadPool()
@@ -80,7 +83,14 @@ internal class V86HttpServer(
             }
 
             when {
-                method == "GET" && path == "/disk" -> serveDisk(output, headers)
+                method == "GET" && path == "/disk" -> {
+                    Log.i(TAG, "$method $path range=${headers["range"]}")
+                    serveDisk(output, headers)
+                }
+                method == "GET" && path == "/hda" -> {
+                    Log.i(TAG, "$method $path range=${headers["range"]}")
+                    serveHda(output, headers)
+                }
                 method == "GET" && path.startsWith("/assets/") -> serveAsset(output, path.removePrefix("/assets/"))
                 else -> respond(output, 404, "text/plain", "Not Found", null)
             }
@@ -106,7 +116,20 @@ internal class V86HttpServer(
             respond(output, 404, "text/plain", "No disk image", null)
             return
         }
+        serveRangeFile(output, headers, file, input)
+    }
 
+    /** 虚拟硬盘（本地 raw 文件），供 v86 的 hda 挂载。 */
+    private fun serveHda(output: OutputStream, headers: Map<String, String>) {
+        val file = hdaPath?.let { File(it) }?.takeIf { it.isFile }
+        if (file == null) {
+            respond(output, 404, "text/plain", "No virtual disk", null)
+            return
+        }
+        serveRangeFile(output, headers, file, null)
+    }
+
+    private fun serveRangeFile(output: OutputStream, headers: Map<String, String>, file: File?, input: InputStream?) {
         val length = file?.length() ?: input?.let { (it.available()).toLong() } ?: 0L
         var start: Long = 0
         var end: Long = length - 1
@@ -235,5 +258,9 @@ internal class V86HttpServer(
             runCatching { serverSocket.close() }
         }
         executor.shutdownNow()
+    }
+
+    companion object {
+        private const val TAG = "LaboxV86Http"
     }
 }
