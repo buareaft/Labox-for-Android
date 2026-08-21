@@ -147,6 +147,57 @@ window.onerror = function (message, source, line, col, error) {
     }
     previous = value;
   });
+  // 软键盘上的 Enter/Tab：阻止 textarea 换行/跳格，改发虚拟机按键
+  kb.addEventListener("keydown", function (event) {
+    if (!emulator) return;
+    if (event.key === "Enter") {
+      event.preventDefault();
+      emulator.keyboard_send_scancodes([0x1C, 0x9C]);
+    } else if (event.key === "Tab") {
+      event.preventDefault();
+      emulator.keyboard_send_scancodes([0x0F, 0x8F]);
+    }
+  });
+
+  // 释放码序列：E0 扩展键按 [E0, key] 成组，释放仍是 [E0, key|0x80]，
+  // 逆序遍历时若前一码是 E0 就归入同组，否则 Ctrl+Alt+Del（Del=E0 53）
+  // 这类组合会拆散 E0 与键码，产生错误释放序列
+  function laboxRelease(codes) {
+    var out = [];
+    var i = codes.length - 1;
+    while (i >= 0) {
+      if (codes[i] === 0xE0) {
+        i--;
+      } else if (i > 0 && codes[i - 1] === 0xE0) {
+        out.push(0xE0, codes[i] | 0x80);
+        i -= 2;
+      } else {
+        out.push(codes[i] | 0x80);
+        i--;
+      }
+    }
+    return out;
+  }
+  // 供 Android 端调用的按键接口：单键与组合键均按下后释放
+  //（scanCodes 支持数组，方向键等扩展键带 0xE0 前缀，如 [0xE0, 0x48]）
+  window.laboxKey = function (scanCodes) {
+    if (!emulator || !Array.isArray(scanCodes) || !scanCodes.length) return;
+    try {
+      emulator.keyboard_send_scancodes(scanCodes);
+      emulator.keyboard_send_scancodes(laboxRelease(scanCodes));
+    } catch (e) {}
+  };
+  window.laboxCombo = function (scancodes) {
+    if (!emulator || !Array.isArray(scancodes) || !scancodes.length) return;
+    try {
+      emulator.keyboard_send_scancodes(scancodes);
+      emulator.keyboard_send_scancodes(laboxRelease(scancodes));
+    } catch (e) {}
+  };
+  window.laboxText = function (text) {
+    if (!emulator || !text) return;
+    try { emulator.keyboard_send_text(text); } catch (e) {}
+  };
 
   // 供 Android 端调用的控制接口
   window.laboxPause = function () { if (emulator) { try { emulator.pause(); } catch (e) {} } };

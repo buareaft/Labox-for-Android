@@ -2,6 +2,7 @@ package com.shilizi.virenvironment
 
 import android.app.AlertDialog
 import android.graphics.Color
+import android.graphics.drawable.GradientDrawable
 import android.net.Uri
 import android.os.Bundle
 import android.util.Log
@@ -13,6 +14,7 @@ import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.FrameLayout
+import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
 import android.widget.TextView
 import androidx.activity.ComponentActivity
@@ -110,6 +112,33 @@ class V86Activity : ComponentActivity() {
         toolbar.addView(keyboardButton)
         toolbar.addView(stopButton)
 
+        // 特殊键面板：第一行功能键，第二行编辑键与组合键（均横向滚动）
+        // 扫描码为 PS/2 Set 1（v86 keyboard_send_scancodes 直接透传），
+        // 方向键/Win/PrtSc 等扩展键带 0xE0 前缀，组合键为各键按下码顺序排列
+        val fnRow = specialKeyRow(
+            "F1" to intArrayOf(0x3B), "F2" to intArrayOf(0x3C), "F3" to intArrayOf(0x3D),
+            "F4" to intArrayOf(0x3E), "F5" to intArrayOf(0x3F), "F6" to intArrayOf(0x40),
+            "F7" to intArrayOf(0x41), "F8" to intArrayOf(0x42), "F9" to intArrayOf(0x43),
+            "F10" to intArrayOf(0x44), "F11" to intArrayOf(0x57), "F12" to intArrayOf(0x58)
+        )
+        val editRow = specialKeyRow(
+            "Esc" to intArrayOf(0x01),
+            "Tab" to intArrayOf(0x0F),
+            "↵" to intArrayOf(0x1C),
+            "空格" to intArrayOf(0x39),
+            "←" to intArrayOf(0xE0, 0x4B),
+            "↑" to intArrayOf(0xE0, 0x48),
+            "→" to intArrayOf(0xE0, 0x4D),
+            "↓" to intArrayOf(0xE0, 0x50),
+            "Ctrl+Alt+Del" to intArrayOf(0x1D, 0x38, 0xE0, 0x53),
+            "Alt+Tab" to intArrayOf(0x38, 0x0F),
+            "Win" to intArrayOf(0xE0, 0x5B),
+            "Win+E" to intArrayOf(0xE0, 0x5B, 0x12),
+            "Win+R" to intArrayOf(0xE0, 0x5B, 0x13),
+            "Win+L" to intArrayOf(0xE0, 0x5B, 0x26),
+            "PrtSc" to intArrayOf(0xE0, 0x2A, 0xE0, 0x37)
+        )
+
         webView = WebView(this)
         val container = FrameLayout(this)
         container.addView(webView, FrameLayout.LayoutParams(
@@ -121,12 +150,55 @@ class V86Activity : ComponentActivity() {
             LinearLayout.LayoutParams.MATCH_PARENT,
             LinearLayout.LayoutParams.WRAP_CONTENT
         ))
+        root.addView(fnRow, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        ))
+        root.addView(editRow, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        ))
         root.addView(container, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT,
             0,
             1f
         ))
         setContentView(root)
+    }
+
+    /** 横向滚动的特殊键行。 */
+    private fun specialKeyRow(vararg keys: Pair<String, IntArray>): HorizontalScrollView {
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(dp(8), dp(3), dp(8), dp(3))
+        }
+        keys.forEach { (label, codes) ->
+            row.addView(keyChip(label) { sendKey(*codes) })
+        }
+        return HorizontalScrollView(this).apply {
+            isHorizontalScrollBarEnabled = false
+            addView(row)
+        }
+    }
+
+    private fun keyChip(label: String, onClick: () -> Unit): TextView =
+        TextView(this).apply {
+            text = label
+            textSize = 12f
+            setTextColor(Color.parseColor("#D8DEE4"))
+            setPadding(dp(10), dp(5), dp(10), dp(5))
+            background = GradientDrawable().apply {
+                cornerRadius = dp(6).toFloat()
+                setColor(Color.parseColor("#2A2E33"))
+            }
+            setOnClickListener { onClick() }
+        }
+
+    /** 向 v86 发送按键：单键或组合键按下+释放（laboxKey 在页面内处理释放序列）。 */
+    private fun sendKey(vararg codes: Int) {
+        val hex = codes.joinToString(",") { "0x%02X".format(it) }
+        Log.i(TAG, "sendKey: [$hex]")
+        evaluate("window.laboxKey && laboxKey([$hex]);")
     }
 
     private fun toolbarButton(label: String, onClick: () -> Unit): TextView =
