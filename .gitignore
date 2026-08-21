@@ -10,6 +10,7 @@
 .kotlin
 local.properties
 app/src/main/jniLibs/*/*.so
+!app/src/main/jniLibs/*/libqemu-system-x86_64.so
 
 # Release signing (私钥不入库)
 /keystore

@@ -1,1 +1,2 @@
 *.apk filter=lfs diff=lfs merge=lfs -text
+app/src/main/jniLibs/*/libqemu-system-x86_64.so filter=lfs diff=lfs merge=lfs -text

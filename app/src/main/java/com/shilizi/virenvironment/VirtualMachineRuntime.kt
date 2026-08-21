@@ -90,9 +90,10 @@ class QemuRuntime : VirtualMachineRuntime {
     override val engine = VmEngine.QEMU
 
     override fun isAvailable(context: Context): Boolean =
-        // 检查 assets 里是否打包了 QEMU 11 依赖库（二进制在 nativeLibraryDir，运行时由系统按 ABI 解压）
-        runCatching { context.assets.open("qemu11/lib/arm64-v8a/libglib-2.0.so").close() }.isSuccess ||
-            runCatching { context.assets.open("qemu11/lib/x86_64/libglib-2.0.so").close() }.isSuccess
+        // 检查 assets 里是否打包了 QEMU 11 依赖库（二进制在 nativeLibraryDir，运行时由系统按 ABI 解压）。
+        // 用标准 soname（libglib-2.0.so.0）——无版本软链 libglib-2.0.so 已被裁剪掉。
+        runCatching { context.assets.open("qemu11/lib/arm64-v8a/libglib-2.0.so.0").close() }.isSuccess ||
+            runCatching { context.assets.open("qemu11/lib/x86_64/libglib-2.0.so.0").close() }.isSuccess
 
     override fun start(context: Context, config: VmLaunchConfig) {
         val plan = config.qemuHardware.toQemuLaunchPlan(config.networkEnabled, config.audioEnabled)

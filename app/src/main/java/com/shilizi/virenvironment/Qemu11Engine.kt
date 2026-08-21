@@ -134,9 +134,12 @@ class Qemu11Engine(
             android.util.Log.w(TAG, "解压失败 ${failures.size} 个文件: ${failures.take(5)}")
             throw IOException("QEMU 解压失败: ${failures.first()}")
         }
-        // 校验 lib 目录完整性
+        // 校验本次 APK 中当前 ABI 的依赖库是否全部解压。依赖可按版本裁剪，
+        // 因此不能用固定数量判断完整性。
         val libCount = File(rootDir, "lib").list()?.size ?: 0
-        if (libCount < 100) throw IOException("QEMU 依赖库不完整 (lib=$libCount)")
+        if (libEntries.isEmpty() || libCount != libEntries.size) {
+            throw IOException("QEMU 依赖库不完整 (expected=${libEntries.size}, actual=$libCount)")
+        }
         marker.writeText("ok")
         onStateChanged("QEMU 解压完成")
     }
