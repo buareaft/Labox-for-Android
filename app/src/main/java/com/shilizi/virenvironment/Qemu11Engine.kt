@@ -519,6 +519,11 @@ class Qemu11Engine(
     private var lastSentY = 0
     private var relInitialized = false
 
+    /** 虚拟触摸板直接产生相对位移。累加而不是覆盖，快速滑动时不会丢失行程。 */
+    private val pendingDeltaX = java.util.concurrent.atomic.AtomicInteger(0)
+    private val pendingDeltaY = java.util.concurrent.atomic.AtomicInteger(0)
+    private val deltaQueued = java.util.concurrent.atomic.AtomicBoolean(false)
+
     /** 请求移动鼠标。高频回调会被合并：最新坐标胜出，input 线程每轮最多发一帧。
      *  ABS：发绝对坐标（需 usb-tablet）；REL：发与上次已发送坐标的位移。 */
     fun sendMouseMove(x: Int, y: Int) {
@@ -552,6 +557,39 @@ class Qemu11Engine(
                 }
                 runCatching { q.execute("input-send-event", mapOf("events" to events)) }
             }
+        }
+    }
+
+    /**
+     * 发送虚拟触摸板的相对位移，与当前是否配置 usb-tablet 无关。
+     * 高频移动先合并，再逐批投递到输入线程，保证按键事件仍能及时执行。
+     */
+    fun sendMouseDelta(dx: Int, dy: Int) {
+        if (dx == 0 && dy == 0) return
+        pendingDeltaX.addAndGet(dx)
+        pendingDeltaY.addAndGet(dy)
+        queueMouseDelta()
+    }
+
+    private fun queueMouseDelta() {
+        if (!deltaQueued.compareAndSet(false, true)) return
+        postInput {
+            val dx = pendingDeltaX.getAndSet(0)
+            val dy = pendingDeltaY.getAndSet(0)
+            val q = qmp
+            if (q != null && (dx != 0 || dy != 0)) {
+                val events = buildList {
+                    if (dx != 0) add(
+                        mapOf("type" to "rel", "data" to mapOf("axis" to "x", "value" to dx))
+                    )
+                    if (dy != 0) add(
+                        mapOf("type" to "rel", "data" to mapOf("axis" to "y", "value" to dy))
+                    )
+                }
+                runCatching { q.execute("input-send-event", mapOf("events" to events)) }
+            }
+            deltaQueued.set(false)
+            if (pendingDeltaX.get() != 0 || pendingDeltaY.get() != 0) queueMouseDelta()
         }
     }
 

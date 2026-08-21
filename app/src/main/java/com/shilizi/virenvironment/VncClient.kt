@@ -22,7 +22,8 @@ import java.util.concurrent.atomic.AtomicBoolean
 internal class VncClient(
     private val port: Int,
     private val onConnected: (width: Int, height: Int) -> Unit,
-    private val onFrame: (Bitmap) -> Unit
+    private val onFrame: (Bitmap) -> Unit,
+    private val onUnavailable: () -> Unit = {}
 ) {
     private val running = AtomicBoolean(true)
     private val destroyed = AtomicBoolean(false)
@@ -30,6 +31,8 @@ internal class VncClient(
     private var socket: Socket? = null
     private var output: DataOutputStream? = null
     private var thread: Thread? = null
+    private var rawBytes = ByteArray(0)
+    private var rawPixels = IntArray(0)
 
     var framebuffer: Bitmap? = null
         private set
@@ -67,12 +70,18 @@ internal class VncClient(
                 Thread.sleep(200)
             }
         }
-        if (!connected) { Log.e(TAG, "VNC 30 秒内未连接成功"); return }
+        if (!connected) {
+            Log.e(TAG, "VNC 30 秒内未连接成功")
+            onUnavailable()
+            return
+        }
         try {
             messageLoop()
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            Log.w(TAG, "VNC 画面连接中断: ${e.message}")
         } finally {
             closeSocket()
+            if (running.get() && !destroyed.get()) onUnavailable()
         }
     }
 
@@ -80,9 +89,7 @@ internal class VncClient(
         val input = DataInputStream(BufferedInputStream(socket.getInputStream()))
         val out = DataOutputStream(BufferedOutputStream(socket.getOutputStream()))
 
-        // 1. 版本协商
-        out.write("RFB 003.008\n".toByteArray(Charsets.US_ASCII))
-        out.flush()
+        // 1. 版本协商：RFB 由服务端先发送版本，客户端回显选定版本。
         val version = ByteArray(12)
         input.readFully(version)
         val versionStr = String(version, Charsets.US_ASCII)
@@ -92,6 +99,9 @@ internal class VncClient(
             versionStr.startsWith("RFB 003.007") -> 7
             else -> 3 // 3.3 或更老
         }
+        val clientVersion = if (minor >= 8) "RFB 003.008\n" else if (minor >= 7) "RFB 003.007\n" else "RFB 003.003\n"
+        out.write(clientVersion.toByteArray(Charsets.US_ASCII))
+        out.flush()
 
         // 2. 安全类型协商（3.7+）
         if (minor >= 7) {
@@ -137,29 +147,32 @@ internal class VncClient(
 
         // 5. 请求 32 位真彩像素格式
         val fmt = ByteArray(16)
-        fmt[0] = 0
-        fmt[1] = 32   // bits-per-pixel
-        fmt[2] = 24   // depth
-        fmt[3] = 0    // big-endian (小端)
-        fmt[4] = 1    // true-colour
-        fmt[5] = 0; fmt[6] = (255).toByte()  // red-max
-        fmt[7] = 0; fmt[8] = (255).toByte()  // green-max
-        fmt[9] = 0; fmt[10] = (255).toByte() // blue-max
-        fmt[11] = 16  // red-shift
-        fmt[12] = 8   // green-shift
-        fmt[13] = 0   // blue-shift
-        fmt[14] = 0; fmt[15] = 0
+        fmt[0] = 32   // bits-per-pixel
+        fmt[1] = 24   // depth
+        fmt[2] = 0    // big-endian-flag（0 = 小端）
+        fmt[3] = 1    // true-colour-flag
+        fmt[4] = 0; fmt[5] = (255).toByte()  // red-max
+        fmt[6] = 0; fmt[7] = (255).toByte()  // green-max
+        fmt[8] = 0; fmt[9] = (255).toByte()  // blue-max
+        fmt[10] = 16  // red-shift
+        fmt[11] = 8   // green-shift
+        fmt[12] = 0   // blue-shift
+        fmt[13] = 0; fmt[14] = 0; fmt[15] = 0
         out.writeByte(0) // SetPixelFormat
+        out.writeByte(0)
+        out.writeByte(0)
+        out.writeByte(0) // padding
         out.write(fmt)
         Log.i(TAG, "VNC 已发送 SetPixelFormat (32bpp)")
 
-        // 6. SetEncodings: Raw(0), CopyRect(1)
+        // 6. SetEncodings: CopyRect(1), Raw(0), DesktopSize(-223)
         // RFB 3.8: type(1) + padding(1) + count(2) + encoding(4)*n
         out.writeByte(2)
         out.writeByte(0) // padding
-        out.writeShort(2)
-        out.writeInt(0) // Raw
+        out.writeShort(3)
         out.writeInt(1) // CopyRect
+        out.writeInt(0) // Raw
+        out.writeInt(-223) // DesktopSize
         out.flush()
 
         this.output = out
@@ -209,7 +222,7 @@ internal class VncClient(
     private fun handleFramebufferUpdate(input: DataInputStream) {
         input.readUnsignedByte() // padding
         val rectCount = input.readUnsignedShort()
-        val bmp = framebuffer ?: return
+        var bmp = framebuffer ?: return
 
         repeat(rectCount) {
             val x = input.readUnsignedShort()
@@ -220,6 +233,16 @@ internal class VncClient(
             when (encoding) {
                 0 -> readRaw(input, bmp, x, y, w, h)
                 1 -> readCopyRect(input, bmp, x, y, w, h)
+                -223 -> {
+                    if (w <= 0 || h <= 0 || w > 4096 || h > 4096) {
+                        throw IOException("VNC 返回无效画面尺寸: ${w}x$h")
+                    }
+                    width = w
+                    height = h
+                    bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+                    framebuffer = bmp
+                    onConnected(w, h)
+                }
                 else -> {
                     Log.e(TAG, "不支持的 VNC 编码: $encoding")
                     throw IOException("不支持的 VNC 编码: $encoding")
@@ -231,17 +254,18 @@ internal class VncClient(
     }
 
     private fun readRaw(input: DataInputStream, bmp: Bitmap, x: Int, y: Int, w: Int, h: Int) {
-        val pixelBytes = w * h * 4
-        val data = ByteArray(pixelBytes)
-        input.readFully(data)
-        val ints = ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN).asIntBuffer()
-        val row = IntArray(w)
-        for (rowIndex in 0 until h) {
-            ints.get(row)
-            // VNC 小端 32bpp: [B,G,R,0] -> ARGB int
-            for (i in 0 until w) row[i] = row[i] or -0x1000000
-            bmp.setPixels(row, 0, w, x, y + rowIndex, w, 1)
+        val pixelCount = w * h
+        val byteCount = pixelCount * 4
+        if (rawBytes.size < byteCount) rawBytes = ByteArray(byteCount)
+        if (rawPixels.size < pixelCount) rawPixels = IntArray(pixelCount)
+        input.readFully(rawBytes, 0, byteCount)
+        val ints = ByteBuffer.wrap(rawBytes, 0, byteCount).order(ByteOrder.LITTLE_ENDIAN).asIntBuffer()
+        ints.get(rawPixels, 0, pixelCount)
+        // VNC 小端 32bpp: [B,G,R,0] -> ARGB int。整块一次提交，避免逐行 JNI 调用。
+        for (i in 0 until pixelCount) {
+            rawPixels[i] = rawPixels[i] or -0x1000000
         }
+        bmp.setPixels(rawPixels, 0, w, x, y, w, h)
     }
 
     private fun readCopyRect(input: DataInputStream, bmp: Bitmap, x: Int, y: Int, w: Int, h: Int) {

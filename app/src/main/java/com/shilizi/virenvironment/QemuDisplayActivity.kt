@@ -21,6 +21,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
@@ -37,7 +38,9 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.OutlinedTextField
@@ -45,6 +48,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -72,23 +76,26 @@ import kotlin.math.hypot
 import kotlin.math.roundToInt
 
 /**
- * QEMU 虚拟机显示界面。QEMU 11 以独立进程运行，画面经 QMP screendump 轮询渲染，
+ * QEMU 虚拟机显示界面。QEMU 11 以独立进程运行，画面优先经 VNC 增量更新渲染，
+ * VNC 不可用时回退 QMP screendump 轮询，
  * 触摸/键盘经 QMP input-send-event 注入。
  *
  * 交互设计（悬浮球集成）：
  *  - 画面占满全屏，右上悬浮球可拖动吸附、点击展开控制面板
  *  - 画面模式：等比(FIT)/拉伸(STRETCH)/原始(ORIGINAL)，双指捏合缩放，缩放后单指平移
- *  - 触摸=鼠标：单指左键、长按/双指右键
+ *  - 虚拟触摸板：相对移动、轻触左键、双指滚轮，支持左/中/右键按住
  */
 class QemuDisplayActivity : ComponentActivity() {
 
     private lateinit var vncView: VncView
+    private var vncClient: VncClient? = null
     private var screendumpThread: Thread? = null
     private var engine: Qemu11Engine? = null
     private var paused = false
     private var finished = false
-    private var lastButtons = 0
     private var immersive = true
+    @Volatile
+    private var vncFrameReceived = false
 
     /** 后台时暂停画面轮询，省电（QEMU 进程保持运行，回来继续渲染）。 */
     @Volatile
@@ -167,19 +174,7 @@ class QemuDisplayActivity : ComponentActivity() {
                     }
                 }
             }
-            // 触摸 → QMP input-send-event 鼠标：usb-tablet 绝对坐标；无 tablet 时相对位移
-            val useTablet = planArgs.any { it.contains("usb-tablet") }
-            eng.pointerMode =
-                if (useTablet) Qemu11Engine.PointerMode.ABS else Qemu11Engine.PointerMode.REL
-            vncView.mouseCallback = { x, y, buttons ->
-                eng.sendMouseMove(x, y)
-                val changed = buttons xor lastButtons
-                if (changed and 1 != 0) eng.sendMouseButton("left", buttons and 1 != 0)
-                if (changed and 4 != 0) eng.sendMouseButton("right", buttons and 4 != 0)
-                lastButtons = buttons
-            }
-            // 双指垂直滑动 = 滚轮滚动
-            vncView.wheelCallback = { notches -> eng.sendWheel(notches) }
+            // 画面只负责查看和缩放；鼠标输入统一由虚拟触摸板发送。
             // 解压 + 启动 + 轮询渲染（后台线程）
             Thread({
                 try {
@@ -193,9 +188,8 @@ class QemuDisplayActivity : ComponentActivity() {
                         eng.stop()
                         return@Thread
                     }
-                    statusText.value = "QEMU 已启动"
-                    // QEMU 11 的 VNC 在纯 TCG 下不推送帧，改用 QMP screendump 轮询渲染
-                    startScreendumpLoop()
+                    runOnUiThread { statusText.value = "正在连接 VNC 画面…" }
+                    startVnc(vncPort)
                 } catch (error: Throwable) {
                     Log.e(TAG, "QEMU 启动失败", error)
                     runOnUiThread { statusText.value = "QEMU 启动失败: ${error.message}" }
@@ -222,7 +216,10 @@ class QemuDisplayActivity : ComponentActivity() {
                 onFullscreen = { toggleFullscreen() },
                 onDisplayMode = { mode -> vncView.displayMode = mode },
                 onKey = { key -> engine?.tapKey(key) },
-                onCombo = { keys -> engine?.tapKeyCombo(*keys.toTypedArray()) }
+                onCombo = { keys -> engine?.tapKeyCombo(*keys.toTypedArray()) },
+                onMouseDelta = { dx, dy -> engine?.sendMouseDelta(dx, dy) },
+                onMouseButton = { button, down -> engine?.sendMouseButton(button, down) },
+                onMouseWheel = { notches -> engine?.sendWheel(notches) }
             )
         }
     }
@@ -264,13 +261,31 @@ class QemuDisplayActivity : ComponentActivity() {
         onFullscreen: () -> Unit,
         onDisplayMode: (DisplayMode) -> Unit,
         onKey: (String) -> Unit,
-        onCombo: (List<String>) -> Unit
+        onCombo: (List<String>) -> Unit,
+        onMouseDelta: (Int, Int) -> Unit,
+        onMouseButton: (String, Boolean) -> Unit,
+        onMouseWheel: (Int) -> Unit
     ) {
         var menuOpen by remember { mutableStateOf(false) }
+        var touchpadVisible by remember { mutableStateOf(true) }
         Surface(color = ComposeColor(0xFF101214), modifier = Modifier.fillMaxSize()) {
             BoxWithConstraints(Modifier.fillMaxSize()) {
                 // 虚拟机画面（占满全屏）
                 AndroidView<SurfaceView>(factory = { vncView }, modifier = Modifier.fillMaxSize())
+
+                AnimatedVisibility(
+                    visible = touchpadVisible && !menuOpen,
+                    modifier = Modifier
+                        .align(Alignment.BottomEnd)
+                        .padding(12.dp)
+                ) {
+                    VirtualTouchpad(
+                        onMouseDelta = onMouseDelta,
+                        onMouseButton = onMouseButton,
+                        onMouseWheel = onMouseWheel,
+                        onHide = { touchpadVisible = false }
+                    )
+                }
 
                 // 半透明遮罩（菜单打开时拦截触摸，点空白关闭）
                 if (menuOpen) {
@@ -304,7 +319,9 @@ class QemuDisplayActivity : ComponentActivity() {
                         onDisplayMode = onDisplayMode,
                         onKeyboard = onKeyboard,
                         onKey = onKey,
-                        onCombo = onCombo
+                        onCombo = onCombo,
+                        touchpadVisible = touchpadVisible,
+                        onToggleTouchpad = { touchpadVisible = !touchpadVisible }
                     )
                 }
             }
@@ -420,7 +437,9 @@ class QemuDisplayActivity : ComponentActivity() {
         onDisplayMode: (DisplayMode) -> Unit,
         onKeyboard: (String) -> Unit,
         onKey: (String) -> Unit,
-        onCombo: (List<String>) -> Unit
+        onCombo: (List<String>) -> Unit,
+        touchpadVisible: Boolean,
+        onToggleTouchpad: () -> Unit
     ) {
         var pausedLocal by remember { mutableStateOf(paused) }
         var keyboardOpen by remember { mutableStateOf(false) }
@@ -439,6 +458,7 @@ class QemuDisplayActivity : ComponentActivity() {
             Row(
                 Modifier
                     .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState())
                     .padding(horizontal = 10.dp),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(6.dp)
@@ -448,7 +468,7 @@ class QemuDisplayActivity : ComponentActivity() {
                     color = ComposeColor(0xFF9AA0A6),
                     fontSize = 12.sp,
                     maxLines = 1,
-                    modifier = Modifier.weight(1f)
+                    modifier = Modifier.widthIn(min = 100.dp, max = 220.dp)
                 )
                 panelButton(if (pausedLocal) "继续" else "暂停") {
                     pausedLocal = !pausedLocal
@@ -472,6 +492,7 @@ class QemuDisplayActivity : ComponentActivity() {
                     modeChip(m.label, vncView.displayMode == m) { onDisplayMode(m) }
                 }
                 modeChip("复位", false) { onDisplayMode(DisplayMode.FIT) }
+                panelButton(if (touchpadVisible) "隐藏触摸板" else "显示触摸板", onToggleTouchpad)
             }
             // 特殊键（水平滚动）
             Row(
@@ -524,6 +545,165 @@ class QemuDisplayActivity : ComponentActivity() {
                         .padding(horizontal = 10.dp, vertical = 4.dp)
                 )
             }
+        }
+    }
+
+    /** 屏幕上的相对鼠标触摸板。轻触移动区为左键单击，双指上下滑动为滚轮。 */
+    @Composable
+    private fun VirtualTouchpad(
+        onMouseDelta: (Int, Int) -> Unit,
+        onMouseButton: (String, Boolean) -> Unit,
+        onMouseWheel: (Int) -> Unit,
+        onHide: () -> Unit
+    ) {
+        val panelShape = RoundedCornerShape(8.dp)
+        Column(
+            modifier = Modifier
+                .widthIn(max = 300.dp)
+                .fillMaxWidth()
+                .background(ComposeColor(0xE61C1F23), panelShape)
+                .border(1.dp, ComposeColor(0x665F6368), panelShape)
+                .padding(6.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = "虚拟触摸板",
+                    color = ComposeColor(0xFFE8EAED),
+                    fontSize = 13.sp,
+                    modifier = Modifier.weight(1f)
+                )
+                TextButton(
+                    onClick = onHide,
+                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
+                    modifier = Modifier.height(28.dp)
+                ) {
+                    Text("隐藏", color = ComposeColor(0xFF9AA0A6), fontSize = 12.sp)
+                }
+            }
+
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(132.dp)
+                    .background(ComposeColor(0xFF303338), RoundedCornerShape(6.dp))
+                    .border(1.dp, ComposeColor(0xFF4C5056), RoundedCornerShape(6.dp))
+                    .pointerInput(onMouseDelta, onMouseButton, onMouseWheel) {
+                        awaitEachGesture {
+                            val firstDown = awaitFirstDown(requireUnconsumed = false)
+                            var previousCenter = firstDown.position
+                            var previousCount = 1
+                            var movedDistance = 0f
+                            var carryX = 0f
+                            var carryY = 0f
+                            var wheelCarry = 0f
+                            val sensitivity = 1.5f
+                            val wheelStep = 28.dp.toPx()
+
+                            while (true) {
+                                val event = awaitPointerEvent()
+                                val pressed = event.changes.filter { it.pressed }
+                                if (pressed.isEmpty()) break
+                                val center = pressed
+                                    .map { it.position }
+                                    .reduce { sum, point -> sum + point } / pressed.size.toFloat()
+
+                                if (pressed.size != previousCount) {
+                                    previousCenter = center
+                                    previousCount = pressed.size
+                                    continue
+                                }
+
+                                val delta = center - previousCenter
+                                previousCenter = center
+                                movedDistance += delta.getDistance()
+                                if (pressed.size >= 2) {
+                                    wheelCarry += delta.y
+                                    val notches = (wheelCarry / wheelStep).toInt()
+                                    if (notches != 0) {
+                                        onMouseWheel(-notches)
+                                        wheelCarry -= notches * wheelStep
+                                    }
+                                } else {
+                                    carryX += delta.x * sensitivity
+                                    carryY += delta.y * sensitivity
+                                    val dx = carryX.toInt()
+                                    val dy = carryY.toInt()
+                                    if (dx != 0 || dy != 0) {
+                                        onMouseDelta(dx, dy)
+                                        carryX -= dx
+                                        carryY -= dy
+                                    }
+                                }
+                                event.changes.forEach { it.consume() }
+                            }
+
+                            if (previousCount == 1 && movedDistance < viewConfiguration.touchSlop) {
+                                onMouseButton("left", true)
+                                onMouseButton("left", false)
+                            }
+                        }
+                    },
+                contentAlignment = Alignment.Center
+            ) {
+                Text("滑动移动 · 轻触单击 · 双指滚动", color = ComposeColor(0xFF9AA0A6), fontSize = 12.sp)
+            }
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                MouseButton("左键", "left", onMouseButton, Modifier.weight(1f))
+                MouseButton("中键", "middle", onMouseButton, Modifier.weight(1f))
+                MouseButton("右键", "right", onMouseButton, Modifier.weight(1f))
+            }
+        }
+    }
+
+    /** 鼠标键保留完整的按下和释放状态，支持按住左键后在触摸区拖动。 */
+    @Composable
+    private fun MouseButton(
+        label: String,
+        button: String,
+        onMouseButton: (String, Boolean) -> Unit,
+        modifier: Modifier = Modifier
+    ) {
+        var pressed by remember { mutableStateOf(false) }
+        DisposableEffect(button) {
+            onDispose {
+                if (pressed) onMouseButton(button, false)
+            }
+        }
+        Box(
+            modifier = modifier
+                .height(42.dp)
+                .background(
+                    if (pressed) ComposeColor(0xFF187A5A) else ComposeColor(0xFF3B3F45),
+                    RoundedCornerShape(6.dp)
+                )
+                .border(1.dp, ComposeColor(0xFF5F6368), RoundedCornerShape(6.dp))
+                .pointerInput(button, onMouseButton) {
+                    awaitEachGesture {
+                        awaitFirstDown(requireUnconsumed = false).consume()
+                        pressed = true
+                        onMouseButton(button, true)
+                        try {
+                            do {
+                                val event = awaitPointerEvent()
+                                event.changes.forEach { it.consume() }
+                            } while (event.changes.any { it.pressed })
+                        } finally {
+                            onMouseButton(button, false)
+                            pressed = false
+                        }
+                    }
+                },
+            contentAlignment = Alignment.Center
+        ) {
+            Text(label, color = ComposeColor.White, fontSize = 13.sp)
         }
     }
 
@@ -667,6 +847,8 @@ class QemuDisplayActivity : ComponentActivity() {
         // 无论何种原因销毁都停掉引擎：QEMU 进程 + 输入线程 + QMP 连接必须随界面释放
         engine?.stop()
         engine = null
+        vncClient?.close()
+        vncClient = null
         // 释放大对象引用（帧缓冲 Bitmap / SurfaceView），确保可被 GC
         vncView.clearFrame()
         super.onDestroy()
@@ -703,19 +885,49 @@ class QemuDisplayActivity : ComponentActivity() {
     private fun findFreePort(): Int =
         ServerSocket(0).use { it.localPort }
 
-    /**
-     * QMP screendump 轮询渲染循环。
-     *
-     * QEMU 11 的 VNC 在纯 TCG（无 KVM）下不推送帧（已验证），
-     * 改用 QMP screendump 截 PNG + BitmapFactory 解码渲染。
-     * 轮询间隔 250ms：FreeDOS 等低速系统足够流畅，避免 TCG 负载过高。
-     */
+    /** 优先使用 VNC 增量帧；连接成功但 5 秒无画面时启动 QMP 兜底。 */
+    private fun startVnc(port: Int) {
+        val client = VncClient(
+            port = port,
+            onConnected = { width, height ->
+                runOnUiThread { statusText.value = "VNC 已连接 ${width}x$height" }
+            },
+            onFrame = { bmp ->
+                if (!vncFrameReceived) {
+                    vncFrameReceived = true
+                    Log.i(TAG, "VNC 首帧 ${bmp.width}x${bmp.height}")
+                    runOnUiThread { statusText.value = "VNC 画面 ${bmp.width}x${bmp.height}" }
+                }
+                if (screenVisible) vncView.drawFrame(bmp)
+            },
+            onUnavailable = {
+                vncFrameReceived = false
+                startScreendumpLoop()
+            }
+        )
+        vncClient = client
+        client.start()
+        Thread({
+            try {
+                Thread.sleep(5000)
+                if (!finished && !vncFrameReceived) {
+                    Log.w(TAG, "VNC 5 秒内无首帧，启用 QMP 画面兜底")
+                    startScreendumpLoop()
+                }
+            } catch (_: InterruptedException) {
+            }
+        }, "labox-vnc-watchdog").also { it.isDaemon = true }.start()
+    }
+
+    /** QMP screendump 低帧率兜底渲染循环。 */
     private fun startScreendumpLoop() {
-        if (screendumpThread != null) return
+        synchronized(this) {
+            if (screendumpThread != null || vncFrameReceived || finished) return
+        }
         screendumpThread = Thread({
             var firstFrame = true
             var frameCount = 0
-            while (!finished && engine?.isRunning() == true) {
+            while (!finished && !vncFrameReceived && engine?.isRunning() == true) {
                 try {
                     if (!screenVisible) {
                         // 后台时暂停轮询省电（QEMU 仍运行，回前台恢复）
