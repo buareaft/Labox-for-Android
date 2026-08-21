@@ -150,7 +150,9 @@ class V86Activity : ComponentActivity() {
             mediaPlaybackRequiresUserGesture = false
             allowFileAccess = false
             allowContentAccess = false
-            cacheMode = WebSettings.LOAD_NO_CACHE
+            // 允许 HTTP 缓存：v86.wasm 响应带 immutable 缓存头，Chromium 的 WASM
+            // 磁盘编译缓存可跨启动命中，避免每次启动重新编译（这是 v86 慢的主因）
+            cacheMode = WebSettings.LOAD_DEFAULT
             mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
         }
         webView.webViewClient = object : WebViewClient() {
@@ -161,6 +163,11 @@ class V86Activity : ComponentActivity() {
 
             override fun onPageFinished(view: WebView, url: String?) {
                 Log.i(TAG, "page finished: $url")
+                // 立即探针：v86 是否已创建、wasm 是否加载成功（title 反映初始化阶段）
+                webView.evaluateJavascript(
+                    "JSON.stringify({title: document.title, v86: typeof V86Starter, emu: typeof window.laboxEmulator, err: document.getElementById('err').style.display})",
+                    { v -> Log.i(TAG, "probe: $v") }
+                )
                 pollStatus()
             }
         }
@@ -185,6 +192,10 @@ class V86Activity : ComponentActivity() {
                 "JSON.stringify({status: window.laboxVmStatus || 'n/a', title: document.title, v86: typeof V86Starter, emu: typeof window.laboxEmulator, canvas: (window.laboxCanvasInfo ? laboxCanvasInfo() : 'na')})",
                 { value ->
                     val status = parseStatus(value)
+                    val title = Regex("\"title\":\"([^\"]*)\"").find(value ?: "")?.groupValues?.get(1)
+                    if (title != null && !title.contains("labox-v86-loading")) {
+                        Log.i(TAG, "page title: $title")
+                    }
                     val canvasInfo = Regex("\"canvas\":\"([^\"]*)\"").find(value ?: "")?.groupValues?.get(1)
                     if (canvasInfo != null && canvasInfo != "none" && canvasInfo != "na") {
                         Log.i(TAG, "canvas: $canvasInfo")

@@ -39,7 +39,16 @@ internal class V86HttpServer(
     private val diskPath: String?,
     private val hdaPath: String? = null
 ) {
-    private val serverSocket = ServerSocket(0, 50, InetAddress.getByName("127.0.0.1"))
+    // 固定端口：v86.wasm 等静态资源的 URL 保持稳定，Chromium 的 WASM 磁盘编译缓存
+    // 才能在下次启动时命中（URL 变化会让缓存 key 失效，每次都重新编译 WASM）
+    private val serverSocket: ServerSocket = run {
+        try {
+            ServerSocket(PORT, 50, InetAddress.getByName("127.0.0.1")).apply { reuseAddress = true }
+        } catch (_: IOException) {
+            // 端口被占用时回退随机端口（罕见，仅放弃跨启动编译缓存）
+            ServerSocket(0, 50, InetAddress.getByName("127.0.0.1"))
+        }
+    }
     private val executor: ExecutorService = Executors.newCachedThreadPool()
     private val running = AtomicBoolean(true)
     private val lock = ReentrantLock()
@@ -91,7 +100,10 @@ internal class V86HttpServer(
                     Log.i(TAG, "$method $path range=${headers["range"]}")
                     serveHda(output, headers)
                 }
-                method == "GET" && path.startsWith("/assets/") -> serveAsset(output, path.removePrefix("/assets/"))
+                method == "GET" && path.startsWith("/assets/") -> {
+                    Log.d(TAG, "$method $path")
+                    serveAsset(output, path.removePrefix("/assets/"))
+                }
                 else -> respond(output, 404, "text/plain", "Not Found", null)
             }
         } catch (_: IOException) {
@@ -161,6 +173,7 @@ internal class V86HttpServer(
             append("HTTP/1.1 $status\r\n")
             append("Content-Type: application/octet-stream\r\n")
             append("Accept-Ranges: bytes\r\n")
+            append("Cache-Control: no-store\r\n")
             append("Content-Length: ${end - start + 1}\r\n")
             if (contentRange != null) append("Content-Range: $contentRange\r\n")
             append("Connection: close\r\n\r\n")
@@ -209,7 +222,12 @@ internal class V86HttpServer(
             respond(output, 404, "text/plain", "Not Found", null)
             return
         }
-        respond(output, 200, mime, null, input)
+        // v86.wasm 等大文件加长缓存：Chromium 基于响应缓存策略生成 WASM 磁盘编译缓存，
+        // 下次启动同 URL 直接复用编译产物，跳过重复编译（启动慢的主要来源）。
+        // index.html 不加缓存，保证每次拿到最新逻辑。
+        val cacheControl = if (path.endsWith(".html")) "no-cache"
+        else "public, max-age=31536000, immutable"
+        respond(output, 200, mime, null, input, mapOf("Cache-Control" to cacheControl))
     }
 
     private fun respond(
@@ -217,7 +235,8 @@ internal class V86HttpServer(
         status: Int,
         contentType: String,
         message: String?,
-        body: InputStream?
+        body: InputStream?,
+        extraHeaders: Map<String, String> = emptyMap()
     ) {
         val statusText = when (status) {
             200 -> "OK"; 206 -> "Partial Content"; 404 -> "Not Found"; 416 -> "Range Not Satisfiable"
@@ -232,6 +251,7 @@ internal class V86HttpServer(
             append("HTTP/1.1 $status $statusText\r\n")
             append("Content-Type: $contentType\r\n")
             append("Content-Length: ${bytes.size}\r\n")
+            extraHeaders.forEach { (k, v) -> append("$k: $v\r\n") }
             append("Connection: close\r\n\r\n")
         }
         output.write(head.toByteArray(Charsets.UTF_8))
@@ -262,5 +282,6 @@ internal class V86HttpServer(
 
     companion object {
         private const val TAG = "LaboxV86Http"
+        private const val PORT = 18432
     }
 }

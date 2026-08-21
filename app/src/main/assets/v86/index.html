@@ -33,6 +33,9 @@ window.onerror = function (message, source, line, col, error) {
 (function () {
   document.title = "labox-script-start";
   var params = new URLSearchParams(location.search);
+  // WASM 编译缓存版本号：升级 v86 运行时（libv86.js/v86.wasm）时 +1，
+  // 让 Chromium 的 WASM 磁盘编译缓存失效，避免用旧编译产物
+  var V86_CACHE_VERSION = "2";
   var memoryMb = Math.min(parseInt(params.get("memory") || "256", 10) || 256, 512);
   var imagePath = params.get("image") || "/images/disk";
   var imageType = params.get("type") || "iso";
