@@ -28,22 +28,6 @@ v86 适合 XP 及更早的系统，启动快、吃资源少。QEMU 适合装 Win
 - 镜像需要自己准备，应用不提供任何系统下载
 - QEMU 的 VirtIO、QXL、TPM 2.0 等选项需要对应的客户机驱动
 
-## 构建
-
-需要 Android SDK，命令行：
-
-```powershell
-.\gradlew.bat assembleDebug
-```
-
-Debug APK 输出到 `app\build\outputs\apk\debug\app-debug.apk`。
-
-Release 签名凭据写在 `local.properties`（keystore 和该文件都不入库），生成签名 APK：
-
-```powershell
-.\gradlew.bat assembleRelease
-```
-
 ## 致谢
 
 - [v86](https://github.com/copy/v86) —— WebAssembly x86 模拟器
