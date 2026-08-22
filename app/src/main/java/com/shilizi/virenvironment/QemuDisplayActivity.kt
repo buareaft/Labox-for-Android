@@ -17,6 +17,11 @@ import android.view.MotionEvent
 import android.view.SurfaceView
 import android.view.View
 import android.view.WindowManager
+import android.view.inputmethod.BaseInputConnection
+import android.view.inputmethod.EditorInfo
+import android.view.inputmethod.InputConnection
+import android.view.inputmethod.InputMethodManager
+import android.text.InputType
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.animation.AnimatedVisibility
@@ -43,7 +48,6 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -88,6 +92,7 @@ import kotlin.math.roundToInt
 class QemuDisplayActivity : ComponentActivity() {
 
     private lateinit var vncView: VncView
+    private lateinit var keyboardInputView: QemuKeyboardInputView
     private var vncClient: VncClient? = null
     private var screendumpThread: Thread? = null
     private var engine: Qemu11Engine? = null
@@ -142,6 +147,10 @@ class QemuDisplayActivity : ComponentActivity() {
         Log.i(TAG, "intent keys=${intent.extras?.keySet()}, qemuArgs=$qemuArgs")
 
         vncView = VncView(this)
+        keyboardInputView = QemuKeyboardInputView(this).apply {
+            onText = { text -> engine?.tapText(text) }
+            onKey = { key -> engine?.tapKey(key) }
+        }
 
         val vncPort = findFreePort()
         val qmpPort = findFreePort()
@@ -208,7 +217,8 @@ class QemuDisplayActivity : ComponentActivity() {
                 paused = paused,
                 confirmStop = confirmStop.value,
                 onPauseClick = { togglePause() },
-                onKeyboard = { text -> sendText(text) },
+                keyboardInputView = keyboardInputView,
+                onShowKeyboard = { showSystemKeyboard() },
                 onStopClick = { stopEmulator() },
                 onRequestStop = { confirmStop.value = true },
                 onDismissStop = { confirmStop.value = false },
@@ -253,7 +263,8 @@ class QemuDisplayActivity : ComponentActivity() {
         paused: Boolean,
         confirmStop: Boolean,
         onPauseClick: () -> Unit,
-        onKeyboard: (String) -> Unit,
+        keyboardInputView: QemuKeyboardInputView,
+        onShowKeyboard: () -> Unit,
         onStopClick: () -> Unit,
         onRequestStop: () -> Unit,
         onDismissStop: () -> Unit,
@@ -272,6 +283,12 @@ class QemuDisplayActivity : ComponentActivity() {
             BoxWithConstraints(Modifier.fillMaxSize()) {
                 // 虚拟机画面（占满全屏）
                 AndroidView<SurfaceView>(factory = { vncView }, modifier = Modifier.fillMaxSize())
+
+                // 仅提供 InputConnection，不显示应用内输入框；输入内容直接发送到虚拟机。
+                AndroidView(
+                    factory = { keyboardInputView },
+                    modifier = Modifier.size(1.dp)
+                )
 
                 AnimatedVisibility(
                     visible = touchpadVisible && !menuOpen,
@@ -317,7 +334,7 @@ class QemuDisplayActivity : ComponentActivity() {
                         onScreenshot = onScreenshot,
                         onFullscreen = onFullscreen,
                         onDisplayMode = onDisplayMode,
-                        onKeyboard = onKeyboard,
+                        onShowKeyboard = onShowKeyboard,
                         onKey = onKey,
                         onCombo = onCombo,
                         touchpadVisible = touchpadVisible,
@@ -435,15 +452,13 @@ class QemuDisplayActivity : ComponentActivity() {
         onScreenshot: () -> Unit,
         onFullscreen: () -> Unit,
         onDisplayMode: (DisplayMode) -> Unit,
-        onKeyboard: (String) -> Unit,
+        onShowKeyboard: () -> Unit,
         onKey: (String) -> Unit,
         onCombo: (List<String>) -> Unit,
         touchpadVisible: Boolean,
         onToggleTouchpad: () -> Unit
     ) {
         var pausedLocal by remember { mutableStateOf(paused) }
-        var keyboardOpen by remember { mutableStateOf(false) }
-        var keyboardText by remember { mutableStateOf("") }
         // 暂停状态由 Activity 持有，面板按钮点击后同步回显
         LaunchedEffect(paused) { pausedLocal = paused }
 
@@ -477,7 +492,7 @@ class QemuDisplayActivity : ComponentActivity() {
                 panelButton("停止", onStopClick)
                 panelButton("截图", onScreenshot)
                 panelButton(if (immersive) "退出全屏" else "全屏", onFullscreen)
-                panelButton("键盘", { keyboardOpen = !keyboardOpen })
+                panelButton("键盘", onShowKeyboard)
             }
             // 画面模式 + 复位
             Row(
@@ -523,27 +538,6 @@ class QemuDisplayActivity : ComponentActivity() {
                 keyChip("↑") { onKey("up") }
                 keyChip("→") { onKey("right") }
                 keyChip("↓") { onKey("down") }
-            }
-            // 软键盘输入（点击「键盘」展开）
-            AnimatedVisibility(visible = keyboardOpen) {
-                OutlinedTextField(
-                    value = keyboardText,
-                    onValueChange = { newValue ->
-                        if (newValue.length > keyboardText.length) {
-                            onKeyboard(newValue.substring(keyboardText.length))
-                        } else {
-                            repeat(keyboardText.length - newValue.length) {
-                                onKeyboard("\u0008")
-                            }
-                        }
-                        keyboardText = newValue
-                    },
-                    placeholder = { Text("键盘输入…") },
-                    singleLine = true,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 10.dp, vertical = 4.dp)
-                )
             }
         }
     }
@@ -758,8 +752,13 @@ class QemuDisplayActivity : ComponentActivity() {
         }
     }
 
-    private fun sendText(text: String) {
-        engine?.tapText(text)
+    private fun showSystemKeyboard() {
+        keyboardInputView.requestFocus()
+        keyboardInputView.post {
+            val inputMethod = getSystemService(InputMethodManager::class.java)
+            inputMethod.restartInput(keyboardInputView)
+            inputMethod.showSoftInput(keyboardInputView, InputMethodManager.SHOW_IMPLICIT)
+        }
     }
 
     /** 全屏切换：显示/隐藏系统导航栏与状态栏。 */
@@ -814,8 +813,8 @@ class QemuDisplayActivity : ComponentActivity() {
 
     /**
      * 实体键盘透传：Android KeyEvent -> QEMU qcode，转发给引擎。
-     * 修饰键（Ctrl/Alt/Shift）按状态同步；Compose 文本框聚焦时按键由文本框
-     * 消费、不会走到这里（不干扰软键盘输入框）。
+     * 修饰键（Ctrl/Alt/Shift）按状态同步；系统软键盘则由 QemuKeyboardInputView
+     * 的 InputConnection 接收，两个输入来源最终使用相同的 QMP 键码。
      */
     override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
         val eng = engine ?: return super.onKeyDown(keyCode, event)
@@ -1048,6 +1047,69 @@ enum class DisplayMode(val label: String) {
     FIT("等比"),
     STRETCH("拉伸"),
     ORIGINAL("原始")
+}
+
+/**
+ * 系统输入法到 QEMU 的无界面输入桥。它是一个真正的文本编辑目标，因此 Android
+ * 键盘可以直接弹出；应用不保存或显示输入内容，提交后立即转换为虚拟机按键。
+ */
+private class QemuKeyboardInputView(context: Context) : View(context) {
+    var onText: (String) -> Unit = {}
+    var onKey: (String) -> Unit = {}
+
+    init {
+        isFocusable = true
+        isFocusableInTouchMode = true
+    }
+
+    override fun onCheckIsTextEditor(): Boolean = true
+
+    override fun onCreateInputConnection(outAttrs: EditorInfo): InputConnection {
+        outAttrs.inputType = InputType.TYPE_CLASS_TEXT or
+            InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD or
+            InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+        outAttrs.imeOptions = EditorInfo.IME_ACTION_NONE or EditorInfo.IME_FLAG_NO_EXTRACT_UI
+
+        return object : BaseInputConnection(this, false) {
+            override fun commitText(text: CharSequence?, newCursorPosition: Int): Boolean {
+                if (!text.isNullOrEmpty()) onText(text.toString())
+                return true
+            }
+
+            override fun setComposingText(text: CharSequence?, newCursorPosition: Int): Boolean {
+                // 组合态尚未确认，不发送；输入法会在确认后调用 commitText。
+                return true
+            }
+
+            override fun finishComposingText(): Boolean = true
+
+            override fun deleteSurroundingText(beforeLength: Int, afterLength: Int): Boolean {
+                repeat(beforeLength.coerceAtMost(32)) { onKey("backspace") }
+                repeat(afterLength.coerceAtMost(32)) { onKey("delete") }
+                return true
+            }
+
+            override fun performEditorAction(actionCode: Int): Boolean {
+                onKey("ret")
+                return true
+            }
+
+            override fun sendKeyEvent(event: KeyEvent): Boolean {
+                if (event.action != KeyEvent.ACTION_DOWN || event.repeatCount != 0) return true
+                when (event.keyCode) {
+                    KeyEvent.KEYCODE_ENTER, KeyEvent.KEYCODE_NUMPAD_ENTER -> onKey("ret")
+                    KeyEvent.KEYCODE_SPACE -> onKey("spc")
+                    KeyEvent.KEYCODE_DEL -> onKey("backspace")
+                    KeyEvent.KEYCODE_FORWARD_DEL -> onKey("delete")
+                    else -> {
+                        val unicode = event.unicodeChar
+                        if (unicode != 0) onText(unicode.toChar().toString())
+                    }
+                }
+                return true
+            }
+        }
+    }
 }
 
 /**
