@@ -49,7 +49,8 @@ enum class WindowsProfile(
     WINDOWS_XP(VmEngine.V86, 1024, 1),
     WINDOWS_7(VmEngine.QEMU, 2048, 2),
     WINDOWS_10(VmEngine.QEMU, 4096, 4),
-    WINDOWS_11(VmEngine.QEMU, 8192, 4)
+    // 默认值需适配常见 Android 设备；宿主内存充足时仍可手动提高。
+    WINDOWS_11(VmEngine.QEMU, 2048, 2)
 }
 
 enum class VmStatus {

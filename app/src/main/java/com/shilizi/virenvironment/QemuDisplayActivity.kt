@@ -10,6 +10,7 @@ import android.net.Uri
 import android.os.Bundle
 import android.os.Environment
 import android.os.Handler
+import android.os.HandlerThread
 import android.os.Looper
 import android.util.Log
 import android.view.KeyEvent
@@ -75,6 +76,8 @@ import androidx.compose.ui.viewinterop.AndroidView
 import java.io.File
 import java.io.FileOutputStream
 import java.net.ServerSocket
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.abs
 import kotlin.math.hypot
 import kotlin.math.roundToInt
@@ -94,6 +97,14 @@ class QemuDisplayActivity : ComponentActivity() {
     private lateinit var vncView: VncView
     private lateinit var keyboardInputView: QemuKeyboardInputView
     private var vncClient: VncClient? = null
+    private lateinit var vncRenderThread: HandlerThread
+    private lateinit var vncRenderHandler: Handler
+    private val pendingVncFrame = AtomicReference<Bitmap?>(null)
+    private val vncRenderQueued = AtomicBoolean(false)
+    private val vncPointerLock = Any()
+    private var vncPointerX = 0
+    private var vncPointerY = 0
+    private var vncPointerButtons = 0
     private var screendumpThread: Thread? = null
     private var engine: Qemu11Engine? = null
     private var paused = false
@@ -113,6 +124,8 @@ class QemuDisplayActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        vncRenderThread = HandlerThread("labox-vnc-render").apply { start() }
+        vncRenderHandler = Handler(vncRenderThread.looper)
         QemuRuntime.display = this
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         enableImmersiveMode()
@@ -227,9 +240,9 @@ class QemuDisplayActivity : ComponentActivity() {
                 onDisplayMode = { mode -> vncView.displayMode = mode },
                 onKey = { key -> engine?.tapKey(key) },
                 onCombo = { keys -> engine?.tapKeyCombo(*keys.toTypedArray()) },
-                onMouseDelta = { dx, dy -> engine?.sendMouseDelta(dx, dy) },
-                onMouseButton = { button, down -> engine?.sendMouseButton(button, down) },
-                onMouseWheel = { notches -> engine?.sendWheel(notches) }
+                onMouseDelta = ::sendPointerDelta,
+                onMouseButton = ::sendPointerButton,
+                onMouseWheel = ::sendPointerWheel
             )
         }
     }
@@ -848,6 +861,9 @@ class QemuDisplayActivity : ComponentActivity() {
         engine = null
         vncClient?.close()
         vncClient = null
+        pendingVncFrame.set(null)
+        vncRenderHandler.removeCallbacksAndMessages(null)
+        vncRenderThread.quitSafely()
         // 释放大对象引用（帧缓冲 Bitmap / SurfaceView），确保可被 GC
         vncView.clearFrame()
         super.onDestroy()
@@ -863,6 +879,7 @@ class QemuDisplayActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         screenVisible = true
+        vncClient?.framebuffer?.let(::enqueueVncFrame)
     }
 
     private fun enableImmersiveMode() {
@@ -889,6 +906,10 @@ class QemuDisplayActivity : ComponentActivity() {
         val client = VncClient(
             port = port,
             onConnected = { width, height ->
+                synchronized(vncPointerLock) {
+                    vncPointerX = width / 2
+                    vncPointerY = height / 2
+                }
                 runOnUiThread { statusText.value = "VNC 已连接 ${width}x$height" }
             },
             onFrame = { bmp ->
@@ -897,7 +918,7 @@ class QemuDisplayActivity : ComponentActivity() {
                     Log.i(TAG, "VNC 首帧 ${bmp.width}x${bmp.height}")
                     runOnUiThread { statusText.value = "VNC 画面 ${bmp.width}x${bmp.height}" }
                 }
-                if (screenVisible) vncView.drawFrame(bmp)
+                enqueueVncFrame(bmp)
             },
             onUnavailable = {
                 vncFrameReceived = false
@@ -916,6 +937,106 @@ class QemuDisplayActivity : ComponentActivity() {
             } catch (_: InterruptedException) {
             }
         }, "labox-vnc-watchdog").also { it.isDaemon = true }.start()
+    }
+
+    /** 触摸板输入优先直接走 RFB PointerEvent，避免纯 TCG 下 QMP 往返造成光标低帧率。 */
+    private fun sendPointerDelta(dx: Int, dy: Int) {
+        val client = vncClient
+        if (client != null && client.width > 0 && client.height > 0) {
+            synchronized(vncPointerLock) {
+                vncPointerX = (vncPointerX + dx).coerceIn(0, client.width - 1)
+                vncPointerY = (vncPointerY + dy).coerceIn(0, client.height - 1)
+                client.sendPointer(vncPointerButtons, vncPointerX, vncPointerY)
+            }
+        } else {
+            engine?.sendMouseDelta(dx, dy)
+        }
+    }
+
+    private fun sendPointerButton(button: String, down: Boolean) {
+        val mask = when (button) {
+            "left" -> 1
+            "middle" -> 2
+            "right" -> 4
+            else -> return
+        }
+        val client = vncClient
+        if (client != null && client.width > 0 && client.height > 0) {
+            synchronized(vncPointerLock) {
+                vncPointerButtons = if (down) vncPointerButtons or mask else vncPointerButtons and mask.inv()
+                client.sendPointer(vncPointerButtons, vncPointerX, vncPointerY)
+            }
+        } else {
+            engine?.sendMouseButton(button, down)
+        }
+    }
+
+    private fun sendPointerWheel(notches: Int) {
+        if (notches == 0) return
+        val client = vncClient
+        if (client != null && client.width > 0 && client.height > 0) {
+            synchronized(vncPointerLock) {
+                val wheelMask = if (notches > 0) 8 else 16
+                repeat(kotlin.math.abs(notches).coerceAtMost(16)) {
+                    client.sendPointer(vncPointerButtons or wheelMask, vncPointerX, vncPointerY)
+                    client.sendPointer(vncPointerButtons, vncPointerX, vncPointerY)
+                }
+            }
+        } else {
+            engine?.sendWheel(notches)
+        }
+    }
+
+    /**
+     * VNC 解码与 Surface 绘制分离。网络线程不等待 lockCanvas；若绘制赶不上解码，
+     * 只保留最新画面，避免旧帧排队造成操作画面越来越迟。
+     */
+    private fun enqueueVncFrame(frame: Bitmap) {
+        pendingVncFrame.set(frame)
+        if (vncRenderQueued.compareAndSet(false, true)) {
+            vncRenderHandler.post(vncRenderRunnable)
+        }
+    }
+
+    private val vncRenderRunnable = object : Runnable {
+        private var renderedFrames = 0
+        private var statsStartedAt = System.nanoTime()
+
+        override fun run() {
+            if (finished) {
+                pendingVncFrame.set(null)
+                vncRenderQueued.set(false)
+                return
+            }
+            val startedAt = System.nanoTime()
+            pendingVncFrame.getAndSet(null)?.let { frame ->
+                if (screenVisible) {
+                    runCatching { vncView.drawFrame(frame) }
+                        .onFailure { Log.w(TAG, "VNC Surface 绘制失败: ${it.message}") }
+                    renderedFrames++
+                }
+            }
+            val now = System.nanoTime()
+            val statsElapsed = now - statsStartedAt
+            if (statsElapsed >= VNC_STATS_INTERVAL_NS) {
+                val fps = renderedFrames * 1_000_000_000.0 / statsElapsed
+                Log.i(TAG, "VNC 渲染帧率 %.1f FPS".format(java.util.Locale.US, fps))
+                renderedFrames = 0
+                statsStartedAt = now
+            }
+
+            if (pendingVncFrame.get() != null) {
+                val elapsedMs = (System.nanoTime() - startedAt) / 1_000_000L
+                vncRenderHandler.postDelayed(this, (VNC_FRAME_INTERVAL_MS - elapsedMs).coerceAtLeast(0L))
+                return
+            }
+
+            vncRenderQueued.set(false)
+            // 消除“检查为空”和 queued=false 之间到达新帧的竞态。
+            if (pendingVncFrame.get() != null && vncRenderQueued.compareAndSet(false, true)) {
+                vncRenderHandler.post(this)
+            }
+        }
     }
 
     /** QMP screendump 低帧率兜底渲染循环。 */
@@ -963,6 +1084,8 @@ class QemuDisplayActivity : ComponentActivity() {
 
     companion object {
         private const val TAG = "LaboxQemu"
+        private const val VNC_FRAME_INTERVAL_MS = 16L
+        private const val VNC_STATS_INTERVAL_NS = 2_000_000_000L
         const val EXTRA_MEDIA_URIS = "media_uris"
         const val EXTRA_MEDIA_NAMES = "media_names"
         const val EXTRA_MEDIA_TYPES = "media_types"

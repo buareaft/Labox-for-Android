@@ -11,6 +11,10 @@ import java.io.IOException
 import java.net.Socket
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.Arrays
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
@@ -27,12 +31,18 @@ internal class VncClient(
 ) {
     private val running = AtomicBoolean(true)
     private val destroyed = AtomicBoolean(false)
+    private val inputWriteConfirmed = AtomicBoolean(false)
     private val socketLock = Object()
+    private val inputExecutor: ExecutorService = Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "labox-vnc-input").apply { isDaemon = true }
+    }
     private var socket: Socket? = null
+    private var input: DataInputStream? = null
     private var output: DataOutputStream? = null
     private var thread: Thread? = null
     private var rawBytes = ByteArray(0)
     private var rawPixels = IntArray(0)
+    private var hextilePixels = IntArray(0)
 
     var framebuffer: Bitmap? = null
         private set
@@ -86,8 +96,9 @@ internal class VncClient(
     }
 
     private fun handshake(socket: Socket) {
-        val input = DataInputStream(BufferedInputStream(socket.getInputStream()))
+        val input = DataInputStream(BufferedInputStream(socket.getInputStream(), NETWORK_BUFFER_SIZE))
         val out = DataOutputStream(BufferedOutputStream(socket.getOutputStream()))
+        this.input = input
 
         // 1. 版本协商：RFB 由服务端先发送版本，客户端回显选定版本。
         val version = ByteArray(12)
@@ -165,17 +176,20 @@ internal class VncClient(
         out.write(fmt)
         Log.i(TAG, "VNC 已发送 SetPixelFormat (32bpp)")
 
-        // 6. SetEncodings: CopyRect(1), Raw(0), DesktopSize(-223)
+        // 6. SetEncodings: CopyRect(1), Hextile(5), Raw(0), DesktopSize(-223)
         // RFB 3.8: type(1) + padding(1) + count(2) + encoding(4)*n
         out.writeByte(2)
         out.writeByte(0) // padding
-        out.writeShort(3)
+        out.writeShort(4)
         out.writeInt(1) // CopyRect
+        out.writeInt(5) // Hextile
         out.writeInt(0) // Raw
         out.writeInt(-223) // DesktopSize
         out.flush()
 
-        this.output = out
+        synchronized(socketLock) {
+            this.output = out
+        }
 
         framebuffer = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
         onConnected(width, height)
@@ -186,8 +200,9 @@ internal class VncClient(
     }
 
     private fun messageLoop() {
-        val input = DataInputStream(BufferedInputStream(socket!!.getInputStream()))
+        val input = input ?: throw IOException("VNC 输入流未初始化")
         var frameCount = 0
+        var statsStartedAt = System.nanoTime()
         while (running.get() && !destroyed.get()) {
             val type = try {
                 input.readUnsignedByte()
@@ -200,8 +215,15 @@ internal class VncClient(
             }
             when (type) {
                 0 -> {
-                    handleFramebufferUpdate(input)
-                    if (++frameCount % 20 == 0) Log.i(TAG, "VNC 已接收 $frameCount 帧")
+                    if (handleFramebufferUpdate(input)) frameCount++
+                    val now = System.nanoTime()
+                    val elapsed = now - statsStartedAt
+                    if (elapsed >= STATS_INTERVAL_NS) {
+                        val fps = frameCount * 1_000_000_000.0 / elapsed
+                        Log.i(TAG, "VNC 解码帧率 %.1f FPS".format(java.util.Locale.US, fps))
+                        frameCount = 0
+                        statsStartedAt = now
+                    }
                 }
                 2 -> { /* Bell: 忽略 */ }
                 3 -> {
@@ -219,10 +241,12 @@ internal class VncClient(
         }
     }
 
-    private fun handleFramebufferUpdate(input: DataInputStream) {
+    /** 返回本次更新是否真正改变了画面。 */
+    private fun handleFramebufferUpdate(input: DataInputStream): Boolean {
         input.readUnsignedByte() // padding
         val rectCount = input.readUnsignedShort()
-        var bmp = framebuffer ?: return
+        var bmp = framebuffer ?: return false
+        var changed = false
 
         repeat(rectCount) {
             val x = input.readUnsignedShort()
@@ -231,8 +255,18 @@ internal class VncClient(
             val h = input.readUnsignedShort()
             val encoding = input.readInt()
             when (encoding) {
-                0 -> readRaw(input, bmp, x, y, w, h)
-                1 -> readCopyRect(input, bmp, x, y, w, h)
+                0 -> {
+                    readRaw(input, bmp, x, y, w, h)
+                    changed = true
+                }
+                1 -> {
+                    readCopyRect(input, bmp, x, y, w, h)
+                    changed = true
+                }
+                5 -> {
+                    readHextile(input, bmp, x, y, w, h)
+                    changed = true
+                }
                 -223 -> {
                     if (w <= 0 || h <= 0 || w > 4096 || h > 4096) {
                         throw IOException("VNC 返回无效画面尺寸: ${w}x$h")
@@ -242,6 +276,7 @@ internal class VncClient(
                     bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
                     framebuffer = bmp
                     onConnected(w, h)
+                    changed = true
                 }
                 else -> {
                     Log.e(TAG, "不支持的 VNC 编码: $encoding")
@@ -249,8 +284,10 @@ internal class VncClient(
                 }
             }
         }
-        onFrame(bmp)
+        // 先请求下一帧，让 QEMU 在显示层绘制当前帧时并行准备后续增量更新。
         requestUpdate(true)
+        if (changed) onFrame(bmp)
+        return changed
     }
 
     private fun readRaw(input: DataInputStream, bmp: Bitmap, x: Int, y: Int, w: Int, h: Int) {
@@ -276,33 +313,115 @@ internal class VncClient(
         bmp.setPixels(src, 0, w, x, y, w, h)
     }
 
+    /** Hextile：把画面拆成 16x16 小块，纯色桌面和窗口区域无需传输每个像素。 */
+    private fun readHextile(input: DataInputStream, bmp: Bitmap, x: Int, y: Int, w: Int, h: Int) {
+        val pixelCount = w * h
+        if (hextilePixels.size < pixelCount) hextilePixels = IntArray(pixelCount)
+        val pixels = hextilePixels
+        var background = -0x1000000
+        var foreground = -0x1000000
+        var tileY = 0
+        while (tileY < h) {
+            val tileH = minOf(16, h - tileY)
+            var tileX = 0
+            while (tileX < w) {
+                val tileW = minOf(16, w - tileX)
+                val subencoding = input.readUnsignedByte()
+                if (subencoding and HEXTILE_RAW != 0) {
+                    for (row in 0 until tileH) {
+                        var offset = (tileY + row) * w + tileX
+                        repeat(tileW) { pixels[offset++] = readPixel(input) }
+                    }
+                    tileX += 16
+                    continue
+                }
+
+                if (subencoding and HEXTILE_BACKGROUND_SPECIFIED != 0) {
+                    background = readPixel(input)
+                }
+                for (row in 0 until tileH) {
+                    val start = (tileY + row) * w + tileX
+                    Arrays.fill(pixels, start, start + tileW, background)
+                }
+                if (subencoding and HEXTILE_FOREGROUND_SPECIFIED != 0) {
+                    foreground = readPixel(input)
+                }
+                if (subencoding and HEXTILE_ANY_SUBRECTS != 0) {
+                    val count = input.readUnsignedByte()
+                    repeat(count) {
+                        val color = if (subencoding and HEXTILE_SUBRECTS_COLOURED != 0) {
+                            readPixel(input)
+                        } else {
+                            foreground
+                        }
+                        val xy = input.readUnsignedByte()
+                        val wh = input.readUnsignedByte()
+                        val sx = xy ushr 4
+                        val sy = xy and 0x0F
+                        val sw = (wh ushr 4) + 1
+                        val sh = (wh and 0x0F) + 1
+                        for (row in sy until minOf(sy + sh, tileH)) {
+                            val start = (tileY + row) * w + tileX + sx
+                            val end = (tileY + row) * w + tileX + minOf(sx + sw, tileW)
+                            if (start < end) Arrays.fill(pixels, start, end, color)
+                        }
+                    }
+                }
+                tileX += 16
+            }
+            tileY += 16
+        }
+        bmp.setPixels(pixels, 0, w, x, y, w, h)
+    }
+
+    /** 当前协商格式为 little-endian 32bpp，线上字节顺序是 B,G,R,0。 */
+    private fun readPixel(input: DataInputStream): Int {
+        val blue = input.readUnsignedByte()
+        val green = input.readUnsignedByte()
+        val red = input.readUnsignedByte()
+        input.readUnsignedByte()
+        return (0xFF shl 24) or (red shl 16) or (green shl 8) or blue
+    }
+
     /** 发送鼠标事件。buttons: bit0=左, bit1=中, bit2=右。 */
     fun sendPointer(buttons: Int, x: Int, y: Int) {
-        synchronized(socketLock) {
-            val out = output ?: return
-            try {
+        enqueueInput { out ->
                 out.writeByte(5)
                 out.writeByte(buttons)
                 out.writeShort(x.coerceIn(0, width - 1))
                 out.writeShort(y.coerceIn(0, height - 1))
-                out.flush()
-            } catch (_: IOException) {
-            }
         }
     }
 
     /** 发送键盘事件。keysym 为 X11 keysym。 */
     fun sendKey(down: Boolean, keysym: Int) {
-        synchronized(socketLock) {
-            val out = output ?: return
-            try {
+        enqueueInput { out ->
                 out.writeByte(4)
                 out.writeByte(if (down) 1 else 0)
                 out.writeShort(0)
                 out.writeInt(keysym)
-                out.flush()
-            } catch (_: IOException) {
+        }
+    }
+
+    /** UI 输入统一在后台串行写入，保证按键顺序且不触发主线程网络异常。 */
+    private fun enqueueInput(write: (DataOutputStream) -> Unit) {
+        if (destroyed.get()) return
+        try {
+            inputExecutor.execute {
+                synchronized(socketLock) {
+                    val out = output ?: return@synchronized
+                    try {
+                        write(out)
+                        out.flush()
+                        if (inputWriteConfirmed.compareAndSet(false, true)) {
+                            Log.i(TAG, "VNC 输入通道工作正常")
+                        }
+                    } catch (error: IOException) {
+                        Log.w(TAG, "VNC 输入发送失败: ${error.message}")
+                    }
+                }
             }
+        } catch (_: RejectedExecutionException) {
         }
     }
 
@@ -326,9 +445,11 @@ internal class VncClient(
     fun close() {
         running.set(false)
         destroyed.set(true)
+        inputExecutor.shutdownNow()
         synchronized(socketLock) {
             try { socket?.close() } catch (_: IOException) {}
             socket = null
+            input = null
             output = null
         }
         thread?.interrupt()
@@ -338,12 +459,20 @@ internal class VncClient(
         synchronized(socketLock) {
             try { socket?.close() } catch (_: IOException) {}
             socket = null
+            input = null
             output = null
         }
     }
 
     companion object {
         private const val TAG = "LaboxVnc"
+        private const val NETWORK_BUFFER_SIZE = 256 * 1024
+        private const val STATS_INTERVAL_NS = 2_000_000_000L
+        private const val HEXTILE_RAW = 1
+        private const val HEXTILE_BACKGROUND_SPECIFIED = 2
+        private const val HEXTILE_FOREGROUND_SPECIFIED = 4
+        private const val HEXTILE_ANY_SUBRECTS = 8
+        private const val HEXTILE_SUBRECTS_COLOURED = 16
 
         /** 把字符转成 X11 keysym。 */
         fun keysymFor(char: Char): Int = when (char) {

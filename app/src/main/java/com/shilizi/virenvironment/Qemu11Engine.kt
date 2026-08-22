@@ -239,6 +239,11 @@ class Qemu11Engine(
             "-qmp", "tcp:127.0.0.1:$qmpPort,server=on,wait=off",
             "-D", File(rootDir, "qemu.log").absolutePath
         )
+        // Android 无 KVM 时统一启用多线程 TCG，并扩大翻译块缓存。生产硬件参数原先
+        // 没有 -accel，会退回 QEMU 默认值；多核 Windows 下会明显拖慢客体执行和显卡刷新。
+        if (qemuArgs.none { it == "-accel" || it.startsWith("-accel ") }) {
+            cmd += listOf("-accel", "tcg,thread=multi,tb-size=256")
+        }
         // 挂载所有介质（ISO 光驱 + 硬盘镜像 + 软盘）与虚拟硬盘。
         // QemuHardware 不再生成磁盘参数，这里统一生成；多条 -drive/-device 显式分配槽位。
         cmd.addAll(buildDiskArguments(prepared))
