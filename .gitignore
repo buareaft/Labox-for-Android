@@ -10,6 +10,15 @@
 .kotlin
 local.properties
 app/src/main/jniLibs/*/*.so
+!app/src/main/jniLibs/*/libcompat-limbo.so
+!app/src/main/jniLibs/*/libcompat-musl.so
+!app/src/main/jniLibs/*/libcompat-SDL2-addons.so
+!app/src/main/jniLibs/*/libcompat-SDL2-ext.so
+!app/src/main/jniLibs/*/libglib-2.0.so
+!app/src/main/jniLibs/*/liblimbo.so
+!app/src/main/jniLibs/*/libpixman-1.so
+!app/src/main/jniLibs/*/libSDL2.so
+!app/src/main/jniLibs/*/libqemu-system-x86_64-sdl.so
 !app/src/main/jniLibs/*/libqemu-system-x86_64.so
 
 # Release signing (私钥不入库)

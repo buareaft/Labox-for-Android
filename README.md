@@ -10,6 +10,7 @@
 - ISO / IMG / QCOW2 / VHD 镜像，通过系统文件选择器导入
 - 支持创建虚拟硬盘，可以像 VMware 一样把系统装进虚拟盘
 - 内存 512MB - 8GB、CPU 1 - 8 核可调（v86 上限 512MB）
+- QEMU 原生 SDL Surface 显示，不经过 VNC 编码/传输/解码；不兼容设备自动回退 VNC
 - 暂停/继续、截图、全屏、软键盘
 - v86 带快捷键面板（F1-F12、Ctrl+Alt+Del、Alt+Tab、Win 等，安全模式引导按 F8）
 - 手机竖屏单栏、平板横屏双栏布局
@@ -33,3 +34,6 @@ v86 适合 XP 及更早的系统，启动快、吃资源少。QEMU 适合装 Win
 - [v86](https://github.com/copy/v86) —— WebAssembly x86 模拟器
 - [QEMU](https://www.qemu.org/) —— 硬件模拟引擎
 - [Limbo](https://github.com/limboemu/limbo) —— Android 上的 QEMU 前端，工程参考了它的预编译库
+
+QEMU 原生显示使用 Limbo Emulator 6.0.1 / QEMU 5.1.0 的 GPL-2.0 原生组件，
+对应许可证随 APK 位于 `assets/licenses/limbo-gpl-2.0.txt`。

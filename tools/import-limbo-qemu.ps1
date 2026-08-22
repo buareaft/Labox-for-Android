@@ -48,4 +48,5 @@ if (Test-Path -LiteralPath $licenseSource -PathType Leaf) {
         -Destination (Join-Path $licenseDestination "limbo-gpl-2.0.txt") -Force
 }
 
-Write-Host "Limbo/QEMU import completed. Build with -PenableQemuBridge=true."
+Write-Warning "此脚本只适用于旧的独立 QEMU 导入流程。原生 SDL 显示请使用 import-limbo-sdl.ps1。"
+Write-Host "Limbo/QEMU import completed."

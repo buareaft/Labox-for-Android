@@ -819,6 +819,7 @@ class QemuDisplayActivity : ComponentActivity() {
             .show()
     }
 
+    @android.annotation.SuppressLint("MissingSuperCall")
     override fun onBackPressed() {
         // 返回键先确认（防误触杀虚拟机），面板停止按钮也走同一入口
         confirmStop.value = true

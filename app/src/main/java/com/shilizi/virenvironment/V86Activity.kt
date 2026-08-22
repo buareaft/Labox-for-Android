@@ -361,6 +361,7 @@ class V86Activity : ComponentActivity() {
         finish()
     }
 
+    @android.annotation.SuppressLint("MissingSuperCall")
     override fun onBackPressed() {
         stopEmulator()
     }

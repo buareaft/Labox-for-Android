@@ -79,13 +79,7 @@ class V86Runtime : VirtualMachineRuntime {
     }
 }
 
-/**
- * QEMU 11 独立进程运行时。
- *
- * QEMU 11 以 Termux bionic 原生可执行文件打包进 assets，运行时解压到私有目录，
- * 通过 ProcessBuilder 启动为独立进程（天然隔离，不污染 UI 进程）。
- * 显示输出走 VNC，控制走 QMP（暂停/继续/退出），均由 [QemuDisplayActivity] 接管。
- */
+/** QEMU 运行时：优先使用 Limbo SDL 原生 Surface，库不可用时回退 QEMU 11/VNC。 */
 class QemuRuntime : VirtualMachineRuntime {
     override val engine = VmEngine.QEMU
 
@@ -97,7 +91,9 @@ class QemuRuntime : VirtualMachineRuntime {
 
     override fun start(context: Context, config: VmLaunchConfig) {
         val plan = config.qemuHardware.toQemuLaunchPlan(config.networkEnabled, config.audioEnabled)
-        val intent = Intent(context, QemuDisplayActivity::class.java).apply {
+        val nativeCore = File(context.applicationInfo.nativeLibraryDir, "libqemu-system-x86_64-sdl.so")
+        val displayClass = if (nativeCore.isFile) QemuSdlActivity::class.java else QemuDisplayActivity::class.java
+        val intent = Intent(context, displayClass).apply {
             putExtra(QemuDisplayActivity.EXTRA_MEDIA_URIS, ArrayList(config.mediaList.map { it.uri.toString() }))
             putExtra(QemuDisplayActivity.EXTRA_MEDIA_NAMES, ArrayList(config.mediaList.map { it.name }))
             putExtra(QemuDisplayActivity.EXTRA_MEDIA_TYPES, ArrayList(config.mediaList.map { it.type.name }))
@@ -112,19 +108,22 @@ class QemuRuntime : VirtualMachineRuntime {
     }
 
     override fun pause() {
-        display?.togglePause()
+        sdlDisplay?.togglePause() ?: display?.togglePause()
     }
 
     override fun resume() {
-        display?.togglePause()
+        sdlDisplay?.togglePause() ?: display?.togglePause()
     }
 
     override fun stop() {
-        display?.stopEmulator()
+        sdlDisplay?.stopEmulator() ?: display?.stopEmulator()
     }
 
     companion object {
         /** 当前显示的 QEMU 界面，由 QemuDisplayActivity 生命周期维护。 */
         var display: QemuDisplayActivity? = null
+
+        /** 当前原生 SDL 显示页。 */
+        var sdlDisplay: QemuSdlActivity? = null
     }
 }

@@ -32,10 +32,10 @@ class QemuHardwareTest {
         val arguments = plan.arguments.joinToString(" ")
 
         assertFalse(config.validate(WindowsProfile.WINDOWS_11).any { it.blocksLaunch })
-        assertTrue(arguments.contains("-machine q35"))
-        assertTrue(arguments.contains("file=@DISK@"))
+        assertTrue(arguments.contains("-machine pc-q35-9.2"))
+        assertFalse(arguments.contains("@DISK@"))
         assertTrue(arguments.contains("file=@OVMF_CODE@"))
-        assertTrue(arguments.contains("-tpmdev"))
+        assertFalse(arguments.contains("-tpmdev"))
         assertTrue(arguments.contains("-netdev user,id=net0"))
         assertTrue("OVMF_CODE.fd" in plan.requiredFiles)
         assertTrue("swtpm" in plan.requiredFiles)
